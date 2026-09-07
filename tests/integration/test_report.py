@@ -33,3 +33,10 @@ def test_report_includes_72k_mtp_and_whole_layer_residency() -> None:
     assert "Measured A100 hardware proxy" in report
     assert "25.4 GB/s aggregate" in report
     assert '"modelCoreFloorReplaced":false' in report
+
+
+def test_all_static_and_dynamic_math_sections_are_rendered() -> None:
+    report = Path("docs/cases/a800-pp8-tp2-shadowkv.html").read_text(encoding="utf-8")
+    assert "document.querySelectorAll('.math-body').forEach" in report
+    assert "Measured A100 hardware proxy" in report
+    assert r"t_{\mathrm{H2D,stage}}=\max" in report

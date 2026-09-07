@@ -1726,13 +1726,15 @@
   <script>
     document.addEventListener('DOMContentLoaded', () => {
       if (typeof window.renderMathInElement !== 'function') return;
-      window.renderMathInElement(document.getElementById('math-body'), {
+      document.querySelectorAll('.math-body').forEach(element => {
+        window.renderMathInElement(element, {
         delimiters: [
           { left: '\\[', right: '\\]', display: true },
           { left: '\\(', right: '\\)', display: false }
         ],
         throwOnError: false,
         strict: 'warn'
+        });
       });
     });
   </script>
