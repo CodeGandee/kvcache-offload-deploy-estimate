@@ -28,9 +28,12 @@ study:
 pixi run kv-shadowkv-sim --samples 256
 pixi run kv-shadowkv-sim --samples 256 --json
 pixi run kv-shadowkv-sim --oracle-recall 1 --oracle-precision 1 --trust-oracle
+pixi run report-assets
 ```
 
-The last command is an optimistic authoritative-oracle upper bound. The published
+The authoritative-oracle command is an optimistic upper bound. `report-assets`
+regenerates and embeds the base, 72K, MTP, and whole-layer residency datasets in the
+standalone report. The published
 central case deliberately omits `--trust-oracle`, so it still verifies the current
 token with landmarks.
 
@@ -58,8 +61,10 @@ The gitlinks pin exact source/metadata commits. See `extern/tracked/README.md` a
 ## Report integrity
 
 `tests/integration/test_report.py` verifies that the standalone HTML contains both
-timing cases, the PP8×TP2 topology, and central result markers. Unit tests verify
-pipeline fill, sparse working-set size, per-GPU layout invariance, and TTFT formulas.
+timing cases, the PP8×TP2 topology, 72K data, MTP cases, whole-layer residency controls,
+and central result markers. Unit tests verify pipeline fill, sparse working-set size,
+MTP acceptance accounting, whole-layer ratio rounding, resident-HBM payload removal,
+per-GPU layout invariance, and TTFT formulas.
 
 The report is standalone except for KaTeX assets loaded from jsDelivr. Its charts and
 case data are embedded directly in the HTML so the file can be opened locally.

@@ -30,6 +30,7 @@ typecheck = "mypy src tests"
 check = { depends-on = ["lint", "format-check", "typecheck", "test"] }
 docs = "mkdocs build --strict"
 serve-docs = "mkdocs serve"
+report-assets = "python scripts/build_interactive_report.py"
 
 [tool.pixi.dependencies]
 python = "3.13.*"

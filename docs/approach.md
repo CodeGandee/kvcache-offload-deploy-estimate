@@ -47,6 +47,7 @@ For context length \(N\) and selected fraction \(\alpha=1/64\),
 
 \[
 S(N)=\alpha N,
+\qquad S(72\mathrm{K})=1{,}152,
 \qquad S(128\mathrm{K})=2{,}048,
 \qquad S(256\mathrm{K})=4{,}096.
 \]
@@ -172,10 +173,10 @@ interval: it omits architecture mismatch and unknown A800 frontier-model profile
 
 ## 9. Separate prefill TTFT from decode TPOT
 
-Long prompts are split into 4K-token chunks. A 128K prompt supplies roughly 32
-pipeline microbatches and a 256K prompt supplies 64, giving PP8 fill efficiencies
-of \(32/39\) and \(64/71\). This makes single-prompt TTFT only moderately slower
-than PP2, while single-user autoregressive decode is much slower.
+Long prompts are split into 4K-token chunks. A 72K, 128K, or 256K prompt supplies
+roughly 18, 32, or 64 pipeline microbatches, giving PP8 fill efficiencies of
+\(18/25\), \(32/39\), and \(64/71\). This makes single-prompt TTFT only moderately
+slower than PP2, while single-user autoregressive decode is much slower.
 
 For a simultaneous cold burst scheduled first-token-first,
 
@@ -189,7 +190,89 @@ For a simultaneous cold burst scheduled first-token-first,
 At sustained offered utilization \(\rho\to1\), queue delay is unbounded. The report's
 100% point is a finite closed batch, not a stable production operating target.
 
-## 10. Extend the repository with another case
+## 10. Add native MTP as a separate decode overlay
+
+The model-fixed NextN layer count is not used as the speculative block length. The
+serving overlay uses the documented deployment starting points: \(k=3\) draft tokens
+for GLM-5.3, \(k=2\) for DeepSeek V4 Flash, and \(k=0\) for Kimi Code 2.7. The report
+evaluates mean consecutively accepted prefixes \(A\in\{1,2\}\). A correct token after
+an earlier rejection is not counted as accepted.
+
+One speculative verification round emits \(A+1\) output tokens, including the target
+correction or bonus token:
+
+\[
+\mathrm{TPOT}_{\mathrm{MTP}}(A)=
+\frac{T_{\mathrm{verify}}(k)+T_{\mathrm{draft}}(k)}{A+1}.
+\]
+
+The calibrated non-ShadowKV target path is split into shared work and a fraction
+\(\beta(C)\) that scales per additional verified position:
+
+\[
+T_{\mathrm{core,verify}}=T_{\mathrm{core}}[1+\beta(C)(k-1)].
+\]
+
+For PP8 models, \(\beta\) rises from 0.15 to 0.25 over the admitted load range; for
+the single-stage V4 Flash replica it rises from 0.30 to 0.55. The remaining core path
+represents shared weight reads, pipeline launch/bubble time, and communication. MTP
+drafting is charged as \(1.5k/L\) of the core floor plus one sequential
+selector/materialization block per draft step.
+
+All \(k\) candidate positions pay target verification. The one-token-ahead KV oracle
+covers only the first target position; deeper positions pay fetch-at-decode selection
+and miss work. The separate MTP plots therefore do not imply a generic
+\((A+1)\)-times speedup.
+
+## 11. Quantize partial HBM residency to whole layers
+
+For a requested exact-KV HBM ratio \(p\), the implementation can retain only an
+integer number of cache-bearing layers:
+
+\[
+n_{\mathrm{resident}}=\operatorname{round}(pL),
+\qquad
+p_{\mathrm{exact}}=\frac{n_{\mathrm{resident}}}{L}.
+\]
+
+The scan evaluates requested ratios 0%, 10%, ..., 100%, distributes the resident
+layers proportionally across PP stages, and plots \(p_{\mathrm{exact}}\). Markers are
+modeled placements. Values between adjacent markers use linear interpolation:
+
+\[
+y(p)=y_i+\frac{p-p_i}{p_{i+1}-p_i}(y_{i+1}-y_i).
+\]
+
+A resident layer keeps full exact K/V in HBM. Landmark/low-rank scoring still selects
+the 1.56% attention working set, but host fetch and low-rank key reconstruction are
+removed for that layer. FP8-resident KV still pays conversion before BF16 compute.
+The per-stage critical addition becomes
+
+\[
+T_{\mathrm{shadow}}(n)=LT_{\mathrm{select}}
++(L-n)T_{\mathrm{offload}}
++nT_{\mathrm{HBM,dequant}}.
+\]
+
+The maximum resident footprint among stage GPUs is checked against
+\(0.90\times80\) GiB minus stored checkpoint weights and a 6 GiB/GPU runtime reserve.
+Hollow chart markers exceed this planning envelope. This check is optimistic because
+mandatory low-rank bases, landmarks, CUDA graphs, and fragmentation are not separately
+sized.
+
+The residency explorer has a discrete load slider for one user and 10%, 20%, ...,
+100% of each scenario's admission ceiling. Its curves use the no-MTP target path so
+the residency effect is not conflated with speculative acceptance.
+
+## 12. Add the 72K context point
+
+The 72K point is 73,728 tokens. Its non-ShadowKV decode floors are calibrated
+extrapolations rather than measurements. Admission ceilings are 48 users for Kimi,
+48 for GLM, and 80 across the two V4 Flash replicas; single-prompt TTFT centers are
+7.5, 8.0, and 4.1 seconds. These values have at least the same ±50% architecture and
+kernel uncertainty as the 128K/256K points.
+
+## 13. Extend the repository with another case
 
 A new deployment case should add:
 

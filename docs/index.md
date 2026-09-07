@@ -9,7 +9,7 @@ cache policy, scheduler assumptions, equations, calibration evidence, and uncert
 
 The first published case covers:
 
-- 128K and 256K input contexts.
+- 72K, 128K, and 256K input contexts.
 - One or two servers, each with 8×NVIDIA A800 80 GB.
 - Kimi Code 2.7 and GLM-5.3 on two servers using PP8×TP2.
 - DeepSeek V4 Flash as two four-GPU replicas on one server.
@@ -18,6 +18,9 @@ The first published case covers:
 - ShadowKV-style 1.56% cache selection.
 - An advisory token-ahead oracle with 80% recall/precision and a fetch-at-decode case,
   both with 60% temporal reuse.
+- Separate native-MTP plots for one and two mean consecutively accepted draft tokens.
+- Whole-layer exact-KV HBM residency from 0% through 100%, with a one-user/10%-step
+  load slider and explicit HBM-feasibility markers.
 
 [Read the case summary](cases/a800-pp8-tp2.md) or open the
 [interactive report](cases/a800-pp8-tp2-shadowkv.html).

@@ -4,7 +4,7 @@ This repository develops reproducible planning estimates for deploying KV-cache
 offloading and sparse-attention techniques on different server topologies. It is
 intended to accumulate additional hardware, topology, model, and scheduler cases.
 
-The first case studies ShadowKV-style 1.56% cache selection at 128K and 256K context
+The first case studies ShadowKV-style 1.56% cache selection at 72K, 128K, and 256K context
 on one or two 8×NVIDIA A800 80 GB servers. Kimi Code 2.7 and GLM-5.3 use PP8×TP2
 across two 400 Gb/s InfiniBand-connected servers; DeepSeek V4 Flash uses two
 four-GPU replicas on one server.
@@ -31,6 +31,7 @@ pixi run check
 pixi run docs
 pixi run kv-estimate 1 8 16 32
 pixi run kv-shadowkv-sim --samples 256
+pixi run report-assets
 ```
 
 If the repository was cloned without dependencies, initialize them with:

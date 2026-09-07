@@ -18,3 +18,14 @@ def test_report_documents_llmservingsim_and_oracle_precision() -> None:
     assert "LLMServingSim" in report
     assert "oracle precision" in report.lower()
     assert "per-transformer-block" in report
+
+
+def test_report_includes_72k_mtp_and_whole_layer_residency() -> None:
+    report = Path("docs/cases/a800-pp8-tp2-shadowkv.html").read_text(encoding="utf-8")
+    assert '"context":72' in report
+    assert "MTP-only decode estimates" in report
+    assert "Mean accepted prefix = 1 token" in report
+    assert "Mean accepted prefix = 2 tokens" in report
+    assert "Whole-layer KV residency scan" in report
+    assert "residency-load-control" in report
+    assert "GENERATED_REPORT_DATA_START" in report

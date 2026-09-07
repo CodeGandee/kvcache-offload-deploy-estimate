@@ -17,6 +17,8 @@
 - [GLM-5.3 checkpoint](https://huggingface.co/zai-org/GLM-5.3)
 - [Hugging Face Transformers](https://github.com/huggingface/transformers)
 - [DeepSeek V4 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
+- [vLLM GLM-5 recipe](https://github.com/vllm-project/recipes/blob/main/models/zai-org/GLM-5.yaml)
+- [vLLM DeepSeek V4 Flash recipe](https://github.com/vllm-project/recipes/blob/main/models/deepseek-ai/DeepSeek-V4-Flash.yaml)
 - [Meta Llama models](https://github.com/meta-llama/llama-models)
 
 Exact revisions used for code inspection are pinned as submodules in
