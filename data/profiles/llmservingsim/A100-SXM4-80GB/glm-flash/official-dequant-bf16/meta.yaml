@@ -1,0 +1,58 @@
+{
+  "hardware": "A100-SXM4-80GB",
+  "hardware_inputs": {
+    "compute_efficiency": 0.4,
+    "fp8_dequant_gvalues_per_second": 455.0,
+    "hbm_kernel_efficiency": 0.5961042492917847,
+    "hbm_stream_gbps": 1765.0,
+    "int4_dequant_gvalues_per_second": 455.0,
+    "nvlink_latency_ms": 0.031,
+    "nvlink_payload_gbps": 274.0,
+    "peak_bf16_tflops": 312.0
+  },
+  "model": "GLM-5.3-Flash",
+  "model_inputs": {
+    "active_parameters_billions": 18.0,
+    "attention_heads": 64,
+    "cache_layers": 11,
+    "config_commit": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a",
+    "config_submodule": "glm-5.3-flash",
+    "display_name": "GLM-5.3-Flash",
+    "expert_weight_bits": 8,
+    "experts": 288,
+    "experts_per_token": 8,
+    "full_index_layers": 11,
+    "hidden_size": 4096,
+    "index_dim": 128,
+    "index_heads": 32,
+    "index_pool": 4,
+    "index_topk": 2048,
+    "key": "glm-flash",
+    "layers": 45,
+    "linear_attention_layers": 34,
+    "lm_head_weight_bits": 16,
+    "moe_intermediate_size": 2048,
+    "moe_layers": 42,
+    "nodes": 1,
+    "nonexpert_weight_bits": 16,
+    "pp_size": 1,
+    "prefill_attention": "hybrid-kda-dsa",
+    "qk_head_dim": 256,
+    "replicas": 1,
+    "stored_weight_gb": 328.326771576,
+    "tp_size": 8,
+    "v_head_dim": 256,
+    "vocab_size": 154880
+  },
+  "profiler_version": "GenZ-bridge-1",
+  "source": {
+    "config_commit": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a",
+    "config_submodule": "glm-5.3-flash",
+    "genz_commit": "091bdd0a2777dfe4d405a8fcdd91c8f12b474bf3",
+    "llmservingsim_commit": "a4053bc1161872420e1e0607cb3409ef659b828e"
+  },
+  "tp_degrees": [
+    8
+  ],
+  "variant": "official-dequant-bf16"
+}

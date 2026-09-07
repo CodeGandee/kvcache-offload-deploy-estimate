@@ -6,6 +6,9 @@ import json
 import re
 from pathlib import Path
 
+from kvcache_offload_deploy_estimate.genz_llmservingsim import (
+    generate_profile_bundles,
+)
 from kvcache_offload_deploy_estimate.llmservingsim_shadowkv import (
     build_interactive_dataset,
 )
@@ -17,6 +20,7 @@ END = "/* GENERATED_REPORT_DATA_END */"
 
 def main() -> None:
     contents = REPORT.read_text(encoding="utf-8")
+    generate_profile_bundles()
     dataset = build_interactive_dataset(sensitivity_samples=256)
     payload = json.dumps(dataset, ensure_ascii=False, separators=(",", ":"))
     pattern = re.compile(rf"{re.escape(START)}.*?{re.escape(END)}", re.DOTALL)
@@ -33,11 +37,11 @@ def main() -> None:
       const loads = reportData.loads;
       let caseMode = location.hash.includes('fetch-at-decode') ? 'fetch' : 'ahead';
       let storageMode = location.hash.includes('fp8-kv') ? 'fp8' : 'bf16';
-      const seriesOrder = ['kimi-72','kimi-128','kimi-256','glm-72','glm-128','glm-256','flash-72','flash-128','flash-256'];
+      const seriesOrder = ['kimi-72','kimi-128','kimi-256','glm-72','glm-128','glm-256','glm-flash-72','glm-flash-128','glm-flash-256','flash-72','flash-128','flash-256'];
       const seriesColors = Object.fromEntries(seriesOrder.map((id,index) => [id,`var(--s${{index + 1}})`]));
       const data = reportData.series.map(series => ({{
         ...series,
-        short: `${{series.model === 'Kimi Code 2.7' ? 'Kimi' : series.model === 'GLM-5.3' ? 'GLM' : 'V4 Flash'}} ${{series.context}}K`,
+        short: `${{series.model === 'Kimi Code 2.7' ? 'Kimi' : series.model === 'GLM-5.3' ? 'GLM' : series.model === 'GLM-5.3-Flash' ? 'GLM Flash' : 'V4 Flash'}} ${{series.context}}K`,
         color: seriesColors[series.id]
       }})).sort((left,right) => seriesOrder.indexOf(left.id) - seriesOrder.indexOf(right.id));
 """

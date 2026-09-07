@@ -1,5 +1,6 @@
 """Tests for the LLMServingSim-compatible ShadowKV event model."""
 
+import math
 from itertools import pairwise
 
 import pytest
@@ -10,6 +11,7 @@ from kvcache_offload_deploy_estimate.llmservingsim_shadowkv import (
     OraclePrefetch,
     PolicyName,
     StorageName,
+    _optimal_microbatch_size,
     _transfer_time_ms,
     estimate_point,
     estimate_residency_scan,
@@ -145,6 +147,7 @@ def test_72k_context_is_part_of_each_model_family() -> None:
     assert {scenario.id for scenario in SCENARIOS if scenario.context_tokens == 73_728} == {
         "kimi-72",
         "glm-72",
+        "glm-flash-72",
         "flash-72",
     }
 
@@ -225,10 +228,10 @@ def test_pp8_per_user_throughput_does_not_improve_with_load(
     assert all(right.per_user_tps <= left.per_user_tps for left, right in pairwise(points))
 
 
-def test_pp8_reference_floor_also_applies_to_interpolated_residency_loads() -> None:
+def test_generated_moe_profile_grows_with_distinct_experts() -> None:
     scenario = next(item for item in SCENARIOS if item.id == "glm-128")
-    assert scenario.reference_tpot_for_users(20) == scenario.reference_bf16_tpot_ms[0]
-    assert scenario.reference_tpot_for_users(17) == scenario.reference_bf16_tpot_ms[0]
+    assert scenario.reference_tpot_for_users(20) > scenario.reference_tpot_for_users(1)
+    assert scenario.reference_tpot_for_users(40) > scenario.reference_tpot_for_users(20)
 
     scans = [
         estimate_residency_scan(
@@ -242,3 +245,18 @@ def test_pp8_reference_floor_also_applies_to_interpolated_residency_loads() -> N
     for residency_index in range(len(scans[0])):
         per_user = [scan[residency_index].estimate.per_user_tps for scan in scans]
         assert all(right <= left for left, right in pairwise(per_user))
+
+
+def test_pp8_scheduler_uses_enough_groups_to_fill_pipeline() -> None:
+    scenario = next(item for item in SCENARIOS if item.id == "glm-128")
+    microbatch = _optimal_microbatch_size(
+        scenario,
+        users=scenario.max_users,
+        policy="oracle-prefetch",
+        storage="fp8",
+        oracle=OraclePrefetch(),
+        reuse=0.60,
+        resident_layers=0,
+        mtp_accepted_tokens=0,
+    )
+    assert microbatch <= math.ceil(scenario.max_users / scenario.pp_size)

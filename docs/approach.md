@@ -1,239 +1,213 @@
 # Estimation approach
 
-## 1. Separate measured inputs from modeled behavior
+This repository uses a reproducible three-part pipeline:
 
-Checkpoint byte totals come from the official Hugging Face repositories. Hardware
-capacities and link rates come from vendor documentation. ShadowKV selector timing
-and reconstruction/fetch ordering come from the paper and its implementation.
+1. official Hugging Face configs define each model's dimensions and attention type;
+2. GenZ converts operator work and the measured A100 hardware envelope into
+   decode/prefill roofline timings;
+3. generated timings are written in LLMServingSim's profile-bundle format and read
+   through LLMServingSim's production interpolation path before external ShadowKV
+   events are added.
 
-Synthetic A100-SXM4 measurements now ground HBM streaming, single- and dual-GPU
-host transfer, small/large peer copy, representative BF16 GEMM efficiency, and a
-custom fused FP8-KV conversion kernel. They are used only as an Ampere proxy for
-the A800 link and conversion terms. Frontier-model kernel fusion, pipeline balance,
-overlap, the non-ShadowKV model-core floor, and final throughput remain modeled.
+It is still a simulation. No frontier-model weights were downloaded or executed.
 
-## 2. Place official checkpoint formats
+## Models and placements
 
-The current case retains each official storage format and converts fragments as they
-are consumed for BF16 compute. It does not keep a second persistent BF16 model copy.
+| Target | Official stored format | Active path | Placement | ShadowKV layers |
+|---|---:|---:|---|---:|
+| Kimi Code 2.7 | 595.2 GB, native INT4 | 32B | PP8×TP2, two nodes | 61 |
+| GLM-5.3 | 755.6 GB, FP8 plus exclusions | 40B | PP8×TP2, two nodes | 78 |
+| GLM-5.3-Flash | 328.3 GB, FP8 plus exclusions | 18B | TP8, one node | 11 of 45 |
+| DeepSeek V4 Flash | 159.6 GB, FP4 experts + FP8 remainder | 13B | two TP4 replicas | 21 of 43 |
 
-| Candidate | Official checkpoint bytes | Placement |
-|---|---:|---|
-| Kimi Code 2.7 | 595.2 GB native INT4 | PP8×TP2, four stages per server |
-| GLM-5.3 | 755.6 GB FP8 plus metadata | PP8×TP2, four stages per server |
-| DeepSeek V4 Flash | 159.6 GB mixed FP4/FP8 | two four-GPU replicas, one server |
+GLM-5.3-Flash is modeled separately. Its official config has 34 KDA
+linear-attention layers and 11 DSA sparse-attention layers. Linear-attention recurrent
+and convolution states remain in HBM; only the 11 DSA layers use the hypothetical
+ShadowKV host-offload path.
 
-For Kimi and GLM, the approximate balanced stage footprints are 74.4 GB and
-94.5 GB respectively, or 37.2 GB and 47.2 GB per GPU before runtime buffers.
+The tracked Hugging Face repositories contain source/config metadata only. Git LFS
+smudge is disabled, so model weight payloads are not checked out.
 
-## 3. Keep exact cache stage-local
+## Hardware inputs
 
-Stages 1–4 are placed on server A and stages 5–8 on server B. Each server stores the
-exact KV data for its own half of the layers in NUMA-local host memory. The selected
-entries move only from that server's RAM to its local GPUs; KV payload does not cross
-InfiniBand.
+The A100-SXM4 GPU 2+3 calibration contributes:
 
-PP8×TP2 and PP2×TP8 have the same balanced per-GPU weight and cache share:
+- 1,765 GB/s streaming HBM;
+- 51.6% median BF16 GEMM memory-bandwidth utilization, with a measured
+  30.7–61.8% range;
+- 455 Gvalue/s fused E4M3 block-scale conversion to BF16;
+- 22.0 GB/s long-transfer H2D to one GPU;
+- 25.4 GB/s aggregate H2D for both GPUs in a TP2 pair;
+- 0.031 ms small P2P latency and 274 GB/s large P2P bandwidth.
+
+The deployment retains 180 GB/s usable host DRAM per node and 40 GB/s usable
+one-way payload over 400 Gb/s InfiniBand as assumptions.
+
+GenZ receives the measured HBM ceiling and a kernel-memory efficiency chosen so
+effective weight bandwidth equals the measured 51.6% of the A100's 2,039 GB/s
+nameplate:
 
 \[
-\frac{W}{8\cdot2}=\frac{W}{2\cdot8}=\frac{W}{16},
+\eta_M=\frac{0.516\times2039}{1765}\approx0.596,
+\qquad BW_{\mathrm{effective}}\approx1052\ \mathrm{GB/s}.
+\]
+
+BF16 peak is 312 TFLOP/s. Central compute efficiency is 40%, the GenZ paper's
+profiling-derived A100 prior.
+
+## GenZ model-forward profile
+
+For aggregate operator \(j\), GenZ supplies its standard max-of-roofs execution
+time. The adapter adds official stored precision and the measured conversion roof:
+
+\[
+t_j=\max\!\left(
+  \frac{F_j}{\eta_C P_{\mathrm{BF16}}},
+  \frac{B_{a,j}+B_{w,j}+B_{o,j}}{\eta_M BW_{\mathrm{HBM}}},
+  \frac{W_j}{R_{\mathrm{dequant}}}
+\right).
+\]
+
+Arithmetic is BF16. Weight bytes use official FP8/INT4/FP4 storage. The maximum
+assumes successful fused conversion, HBM read, and matmul consumption. An unfused
+implementation would add conversion time and be slower.
+
+The active-parameter totals come from the model releases. Exact config dimensions
+split each active path into shared/attention/LM-head and routed-expert work. For a
+batch of \(C\) sequences with \(k\) choices among \(E\) experts, balanced routing
+touches an expected
+
+\[
+E_{\mathrm{active}}(C)=E\left[1-\left(1-\frac1E\right)^{kC}\right].
+\]
+
+Shared weights are read once per batch. Routed-expert traffic grows with
+\(E_{\mathrm{active}}\), while expert arithmetic grows with \(kC\). This replaces
+the former hand-set load curves and explains why Kimi/GLM per-user performance
+degrades at high concurrency.
+
+Tensor-parallel collectives use a GenZ ring-style latency/bandwidth expression with
+the measured P2P inputs. Two activation reductions per transformer block are
+included. No cross-node expert parallelism is modeled.
+
+## LLMServingSim bridge
+
+The GenZ sweep covers 1–128 simultaneous sequences and is written to:
+
+```text
+data/profiles/llmservingsim/A100-SXM4-80GB/<model>/official-dequant-bf16/
+├── meta.yaml
+└── tp<N>/per_sequence.csv
+```
+
+The CSV uses LLMServingSim's documented schema:
+
+```text
+layer,sequences,time_us
+model_core,1,...
+model_core_stage_0,1,...
+model_core,2,...
+```
+
+The estimator calls pinned upstream `_lookup_per_sequence`, which builds the table
+and interpolates it exactly as LLMServingSim does. Total rows support inspection;
+stage rows drive PP scheduling. The stage split follows the upstream vLLM-compatible
+pipeline partitioner, with distributed block work proportional to the assigned block
+count and the vocabulary projection on the last stage. ShadowKV events remain external
+because tiered-KV block recall does not represent low-rank reconstruction or landmarks.
+
+GenZ and LLMServingSim do different jobs: GenZ produces the missing
+hardware/model service-time table; LLMServingSim consumes it using its serving
+profile contract and supplies pipeline semantics.
+
+## ShadowKV events
+
+For context \(N\), selected fraction \(\alpha=1/64\), cache-bearing layers \(L\),
+cached width \(d_c\), TP degree \(G\), and stored bytes/value \(b\):
+
+\[
+S(N)=\lceil\alpha N\rceil,
 \qquad
-\frac{L/8}{2}=\frac{L/2}{8}=\frac{L}{16}.
+B_{\mathrm{sel,GPU}}=\frac{S(N)Ld_cb}{G}.
 \]
 
-Only the stage-4→5 BF16 activation crosses the 400 Gb/s InfiniBand link. Six other
-pipeline boundaries remain inside the two servers on NVLink.
-
-Within one TP2 stage, both GPUs share a measured host-transfer service center. The
-model therefore caps simultaneous traffic at 25.4 GB/s for the pair rather than
-granting each GPU its approximately 22 GB/s single-transfer result. Other TP2 pairs are assumed
-to have independent PCIe paths until the node-wide 180 GB/s host-DRAM ceiling.
-
-## 4. Compute the sparse working set
-
-For context length \(N\) and selected fraction \(\alpha=1/64\),
+After 60% temporal reuse, the central 80%-recall/80%-precision token-ahead oracle
+prefetches 0.40 of the selected set and leaves 0.08 just in time:
 
 \[
-S(N)=\alpha N,
-\qquad S(72\mathrm{K})=1{,}152,
-\qquad S(128\mathrm{K})=2{,}048,
-\qquad S(256\mathrm{K})=4{,}096.
-\]
-
-For \(L\) cache-bearing layers, exact cached width \(d_c\), value size \(b\),
-\(P\) pipeline stages, and \(G_s\) GPUs per stage, the balanced selected payload per
-GPU and request is
-
-\[
-B_{\mathrm{sel,GPU}}=
-\frac{S(N)(L/P)d_cb}{G_s}.
-\]
-
-The Python implementation is in `src/kvcache_offload_deploy_estimate/model.py`.
-
-## 5. Model the two cache-fetch cases with LLMServingSim events
-
-The tracked LLMServingSim checkout supplies the vLLM-compatible transformer-block
-pipeline partitioner and the vocabulary for per-stage traces. The ShadowKV extension
-lives in `src/kvcache_offload_deploy_estimate/llmservingsim_shadowkv.py`; upstream is
-not patched because its normal tiered block recall does not contain ShadowKV's
-per-block landmark-selection dependency.
-
-The extension inserts, for every cache-bearing transformer block:
-
-1. landmark GEMM/softmax, max reduction, and top-K selection;
-2. optional one-token-ahead background prefetch;
-3. the current token's just-in-time miss materialization;
-4. overlapping key reconstruction and value/latent fetch;
-5. FP8 dequantization before BF16 attention compute.
-
-ShadowKV Table 13 is a **per-transformer-block** measurement. Both selection and
-`max(reconstruct K, fetch V)` are therefore charged once per cache-bearing block.
-
-### Case A: token-ahead prediction
-
-Let \(r=0.60\) be entries reused from the preceding token. Over the remaining
-entries, the advisory oracle has recall \(R_o=0.80\) and precision \(P_o=0.80\).
-Prefetch and just-in-time traffic are
-
-\[
-B_{\mathrm{prefetch}}=(1-r)\frac{R_o}{P_o}B_{\mathrm{sel}}=0.40B_{\mathrm{sel}},
+f_{\mathrm{prefetch}}=(1-r)\frac{R_o}{P_o}=0.40,
 \qquad
-B_{\mathrm{JIT}}=(1-r)(1-R_o)B_{\mathrm{sel}}=0.08B_{\mathrm{sel}}.
+f_{\mathrm{JIT}}=(1-r)(1-R_o)=0.08.
 \]
 
-The current query still runs landmark selection to verify the exact set and discover
-misses. Prefetch may overlap the preceding token; selection and the 0.08 miss set are
-exposed. A perfect authoritative oracle would instead use recall=precision=1 and
-could optionally skip verification, but that is not the central case.
+Prefetch overlaps the preceding token's model-forward window. The current token
+still verifies landmarks. Fetch-at-decode has no background prefetch and exposes
+the full 40% post-reuse miss set.
 
-### Case B: fetch at decode
-
-Landmark selection and miss discovery occur on the current query. With temporal
-reuse \(r=0.60\), the current step materializes
+For a cache-bearing block:
 
 \[
-S_{\mathrm{miss}}=(1-r)S=0.4S.
+t_{\ell}=t_{\mathrm{select},\ell}
++\max(t_{K,\ell},t_{V,\ell}+t_{\mathrm{dequant},\ell})
++t_{\mathrm{attention},\ell}.
 \]
 
-Key and value branches may overlap with each other, but sparse attention waits for
-both. Per layer, and then summed over every cache-bearing block,
+ShadowKV Table 13 grounds selector/materialization centers. Reusing its Llama
+per-block measurements on these architectures is a major extrapolation.
+
+For one TP2 stage with per-GPU bytes \(B_g\):
 
 \[
-t_{\mathrm{layer}}=t_{\mathrm{QKV}}+t_{\mathrm{select}}
-+\max(t_K,t_V)+t_{\mathrm{attention}}+t_{\mathrm{FFN}}.
+t_{\mathrm{H2D,stage}}=\max\!\left(
+\frac{B_g}{22.0\ \mathrm{GB/s}},
+\frac{2B_g}{25.4\ \mathrm{GB/s}},
+\frac{2B_g}{180\ \mathrm{GB/s}}
+\right).
 \]
 
-## 6. Model PP8×TP2 pipeline fill
+## TPOT and throughput
 
-Let \(m\) be independently schedulable decode microbatches, \(P=8\), and
-\(t_*=\max_j t_j\) the slowest balanced-stage time. A forward wave takes
+For a PP microbatch of \(b\) sequences, let \(s_p(b)\) be the generated core
+time of stage \(p\), its local ShadowKV critical work, and its outgoing PP edge.
+With \(g=\lceil C/b\rceil\) request groups, the LLMServingSim in-flight cap gives:
 
 \[
-T_{\mathrm{wave}}\approx(m+P-1)t_*=(m+7)t_*,
+T_{\mathrm{compute}}(C,b)=\max(P,g)\max_p s_p(b).
+\]
+
+Token-ahead copies overlap compute, but in steady state each group contributes one
+node-local prefetch payload. Thus they also impose the service-rate constraint
+
+\[
+T_{\mathrm{H2D}}(C,b)=g\,t_{\mathrm{prefetch,node}}(b),
 \qquad
-\eta_{\mathrm{PP8}}=\frac{m}{m+7}.
+T_{\mathrm{step}}(C,b)=\max(T_{\mathrm{compute}},T_{\mathrm{H2D}}).
 \]
 
-A PP8 stage has one eighth of the layers but one quarter of the tensor parallelism
-of a TP8 stage, so its time is approximately half the one-node TP8 full-model time.
-The ideal two-node throughput multiplier is therefore \(2m/(m+7)\), not
-\(8m/(m+7)\).
-
-Relative to the earlier PP2×TP8 estimate, the central ratio is
+The known-request scheduler searches
+\(1\le b\le\lceil C/P\rceil\). Larger microbatches would leave fewer than \(P\)
+groups, underfill the pipeline, and cannot improve a monotone stage service curve.
+PP=1 placements retain the complete continuous batch.
 
 \[
-\frac{Y_{\mathrm{PP8}}}{Y_{\mathrm{PP2}}}
-\approx g_{\mathrm{TP2}}\frac{m+1}{m+7},
-\qquad g_{\mathrm{TP2}}=1.03.
+Y_{\mathrm{total}}=\frac{1000C}{T_{\mathrm{step}}},
+\qquad
+Y_{\mathrm{user}}=\frac{1000}{T_{\mathrm{step}}},
+\qquad
+\mathrm{TPOT}=T_{\mathrm{step}}.
 \]
 
-The one-user ratio is set to 0.24 to include six extra intra-node stage handoffs.
-The favorable central curve uses one request per decode microbatch, \(m=C\). If a
-runtime groups \(g\) requests per microbatch, use \(m=\lceil C/g\rceil\), which
-increases bubbles. Successive tokens from one user cannot fill the pipeline because
-token \(t+1\) depends on token \(t\).
+DeepSeek V4 Flash divides users over two replicas before the profile lookup.
 
-The ratio above is a **capacity multiplier**, not an inverse per-user-latency
-multiplier. An earlier revision applied it directly to TPOT and incorrectly made a
-GLM request decode faster when unrelated requests were added. For every PP placement,
-the implementation now imposes the autoregressive recurrence floor
+## Prefill and TTFT
 
-\[
-T_{\mathrm{ref}}(C)=
-\max\!\left[T_{\mathrm{ref,raw}}(C),T_{\mathrm{ref,raw}}(1)\right],
-\qquad P>1.
-\]
+Prefill uses 2K chunks and the same GenZ hardware. It includes active-path
+projection/MoE work, official stored bytes per chunk, and architecture-specific
+attention arithmetic: dense MLA for Kimi; DSA indexing for GLM; KDA plus pooled DSA
+for GLM Flash; and official 4×/128× compression for V4 Flash.
 
-The explicit selector, materialization, transfer, and dequantization terms still grow
-with active requests. Consequently, PP8 total throughput can rise as stages become
-occupied, while per-user throughput cannot exceed the one-user path. This is a
-conservative correction until batch-size-dependent stage timings are measured; a
-future measured model should replace the floor with
-\(T_{\mathrm{cycle}}=\max(m,P)t_{\mathrm{stage}}(g)\), where both microbatch count
-\(m\) and microbatch size \(g\) are explicit.
-
-The eight stages must be balanced by measured time, not merely by layer count. The
-slowest stage sets pipeline cadence, especially for heterogeneous MoE blocks.
-
-## 7. Model FP8 KV storage on A800
-
-One FP8 byte plus one FP32 scale per 128 values has byte ratio
-
-\[
-q_{\mathrm{bytes}}=\frac{1+4/128}{2}=0.515625
-\]
-
-relative to BF16 KV. The extension does not apply a blanket effective multiplier.
-It scales stored-byte transfer by 0.515625, adds explicit dequantization at a central
-455 Gvalue/s, and leaves low-rank reconstruction plus attention in BF16. The
-sensitivity run samples 320–520 Gvalue/s. This makes FP8 gains small whenever key
-reconstruction is the critical materialization branch.
-
-## 8. Calibrate hardware primitives on A100
-
-The public synthetic run used physical GPUs 2 and 3 on one 8×A100-SXM4-80GB host,
-with CPU and memory bound to their NUMA node. It used a locked Pixi environment on
-local NVMe and downloaded no model weights.
-
-| Primitive | Measured center | How it is used |
-|---|---:|---|
-| SM streaming HBM | 1,765 GB/s | Roofline sanity check; 86.6% of 2,039 GB/s nameplate |
-| H2D, one GPU, long transfer | 22.0 GB/s | Per-GPU transfer ceiling |
-| H2D, both TP2 GPUs concurrently | 25.4 GB/s aggregate | Shared TP2-pair transfer ceiling; about 12.7 GB/s/GPU |
-| P2P, 4 KiB | 0.031 ms | Conservative small-handoff launch/synchronization proxy |
-| P2P, 256 MiB | 274 GB/s | Large-copy topology check |
-| Fused E4M3 block-128 → BF16 | 455 Gvalue/s | FP8-KV dequantization center |
-| Representative BF16 GEMM MBU | 51.6% median, 30.7–61.8% range | Kernel-level plausibility check only |
-
-The custom fused dequant kernel sustained about 1.38 TB/s of useful input, scale,
-and output traffic. A separate PyTorch cast-plus-scale path reached only about
-80 Gvalue/s, so fusion is a necessary condition for the central FP8 result.
-
-The 51.6% GEMM MBU is not substituted for end-to-end model MBU. It excludes MoE
-routing, collectives, attention, pipeline bubbles, launch gaps, and official
-FP8/INT4/FP4 weight-unpack kernels. Replacing the model-core floor requires those
-operators or a full-model decode profile; the current run calibrates only the
-incremental offload/conversion path. The exact script, Pixi lock, CUDA kernel, and
-raw JSON are under `benchmarks/a100-sxm4/`.
-
-## 9. Parameter sensitivity, not confidence
-
-Each displayed center has a reproducible 256-sample sensitivity study. It varies
-single-GPU PCIe bandwidth (20.5–23.5 GB/s), concurrent TP2-pair bandwidth
-(23–28 GB/s aggregate), node host-DRAM bandwidth (130–220 GB/s), FP8 dequantization
-(320–520 Gvalue/s), selector timing (20% log-normal spread), and materialization
-timing (25% spread). The resulting p10–p90 range is not a confidence interval: it
-omits A100→A800 topology mismatch and unknown frontier-model operator profiles.
-
-## 10. Separate prefill TTFT from decode TPOT
-
-Long prompts are split into 4K-token chunks. A 72K, 128K, or 256K prompt supplies
-roughly 18, 32, or 64 pipeline microbatches, giving PP8 fill efficiencies of
-\(18/25\), \(32/39\), and \(64/71\). This makes single-prompt TTFT only moderately
-slower than PP2, while single-user autoregressive decode is much slower.
-
-For a simultaneous cold burst scheduled first-token-first,
+For PP placements the fill multiplier is
+\((n_{\mathrm{chunk}}+P-1)/n_{\mathrm{chunk}}\). Cold-burst TTFT uses:
 
 \[
 \overline{\mathrm{TTFT}}\approx T_0\frac{C_r+1}{2},
@@ -242,101 +216,39 @@ For a simultaneous cold burst scheduled first-token-first,
 \qquad C_r=\left\lceil\frac{C}{R}\right\rceil.
 \]
 
-At sustained offered utilization \(\rho\to1\), queue delay is unbounded. The report's
-100% point is a finite closed batch, not a stable production operating target.
+## MTP and whole-layer residency
 
-## 11. Add native MTP as a separate decode overlay
-
-The model-fixed NextN layer count is not used as the speculative block length. The
-serving overlay uses the documented deployment starting points: \(k=3\) draft tokens
-for GLM-5.3, \(k=2\) for DeepSeek V4 Flash, and \(k=0\) for Kimi Code 2.7. The report
-evaluates mean consecutively accepted prefixes \(A\in\{1,2\}\). A correct token after
-an earlier rejection is not counted as accepted.
-
-One speculative verification round emits \(A+1\) output tokens, including the target
-correction or bonus token:
+For MTP-capable models, verification of \(k\) positions queries the generated core
+profile at the enlarged batch:
 
 \[
-\mathrm{TPOT}_{\mathrm{MTP}}(A)=
-\frac{T_{\mathrm{verify}}(k)+T_{\mathrm{draft}}(k)}{A+1}.
+T_{\mathrm{core,verify}}(C,k)=T_{\mathrm{profile}}(kC).
 \]
 
-The calibrated non-ShadowKV target path is split into shared work and a fraction
-\(\beta(C)\) that scales per additional verified position:
+If the mean accepted prefix is \(A\), the round emits \(A+1\) tokens. The oracle
+applies only to the first position; later positions pay fetch-at-decode cache work.
 
-\[
-T_{\mathrm{core,verify}}=T_{\mathrm{core}}[1+\beta(C)(k-1)].
-\]
-
-For PP8 models, \(\beta\) rises from 0.15 to 0.25 over the admitted load range; for
-the single-stage V4 Flash replica it rises from 0.30 to 0.55. The remaining core path
-represents shared weight reads, pipeline launch/bubble time, and communication. MTP
-drafting is charged as \(1.5k/L\) of the core floor plus one sequential
-selector/materialization block per draft step.
-
-All \(k\) candidate positions pay target verification. The one-token-ahead KV oracle
-covers only the first target position; deeper positions pay fetch-at-decode selection
-and miss work. The separate MTP plots therefore do not imply a generic
-\((A+1)\)-times speedup.
-
-## 12. Quantize partial HBM residency to whole layers
-
-For a requested exact-KV HBM ratio \(p\), the implementation can retain only an
-integer number of cache-bearing layers:
+Residency requests are rounded to implementable whole layers:
 
 \[
 n_{\mathrm{resident}}=\operatorname{round}(pL),
-\qquad
-p_{\mathrm{exact}}=\frac{n_{\mathrm{resident}}}{L}.
+\qquad p_{\mathrm{exact}}=n_{\mathrm{resident}}/L.
 \]
 
-The scan evaluates requested ratios 0%, 10%, ..., 100%, distributes the resident
-layers proportionally across PP stages, and plots \(p_{\mathrm{exact}}\). Markers are
-modeled placements. Values between adjacent markers use linear interpolation:
+Resident layers lose host fetch and low-rank reconstruction. The chart plots exact
+ratios and interpolates only between adjacent implementable points.
 
-\[
-y(p)=y_i+\frac{p-p_i}{p_{i+1}-p_i}(y_{i+1}-y_i).
-\]
+## Sensitivity
 
-A resident layer keeps full exact K/V in HBM. Landmark/low-rank scoring still selects
-the 1.56% attention working set, but host fetch and low-rank key reconstruction are
-removed for that layer. FP8-resident KV still pays conversion before BF16 compute.
-The per-stage critical addition becomes
+The p10–p90 band is a deterministic parameter-sensitivity interval, not a confidence
+interval. It varies compute efficiency, measured GEMM MBU, HBM, PCIe, host DRAM,
+FP8/INT4 conversion, NVLink payload, selector timing, and materialization timing.
 
-\[
-T_{\mathrm{shadow}}(n)=LT_{\mathrm{select}}
-+(L-n)T_{\mathrm{offload}}
-+nT_{\mathrm{HBM,dequant}}.
-\]
+The central microbatch choice is held fixed across sensitivity samples. This avoids
+turning each uncertainty draw into a different scheduler and makes the band describe
+hardware/kernel uncertainty around one explicit operating policy.
 
-The maximum resident footprint among stage GPUs is checked against
-\(0.90\times80\) GiB minus stored checkpoint weights and a 6 GiB/GPU runtime reserve.
-Hollow chart markers exceed this planning envelope. This check is optimistic because
-mandatory low-rank bases, landmarks, CUDA graphs, and fragmentation are not separately
-sized.
-
-The residency explorer has a discrete load slider for one user and 10%, 20%, ...,
-100% of each scenario's admission ceiling. Its curves use the no-MTP target path so
-the residency effect is not conflated with speculative acceptance.
-
-## 12. Add the 72K context point
-
-The 72K point is 73,728 tokens. Its non-ShadowKV decode floors are calibrated
-extrapolations rather than measurements. Admission ceilings are 48 users for Kimi,
-48 for GLM, and 80 across the two V4 Flash replicas; single-prompt TTFT centers are
-7.5, 8.0, and 4.1 seconds. These values have at least the same ±50% architecture and
-kernel uncertainty as the 128K/256K points.
-
-## 13. Extend the repository with another case
-
-A new deployment case should add:
-
-1. A Markdown case summary in `docs/cases/`.
-2. Its interactive or static artifact beside the summary.
-3. Hardware, checkpoint, topology, cache, scheduler, and uncertainty assumptions.
-4. Formula changes in the Python package when the analytical model changes.
-5. Unit tests for new equations and an integration test for the published artifact.
-6. Pinned external implementations under `extern/tracked/` when new code is used.
-
-Do not silently reuse A800 bandwidth, PP8 fill, or ShadowKV selector constants for a
-different server or algorithm.
+Important omissions remain: real fused frontier-model kernels, routing skew, expert
+imbalance, framework launch gaps, A800-specific collectives, mixed prefill/decode
+interference, and quality validation. Treat centers as planning values and expect at
+least ±50% error until full operator profiles are available.

@@ -1,0 +1,58 @@
+{
+  "hardware": "A100-SXM4-80GB",
+  "hardware_inputs": {
+    "compute_efficiency": 0.4,
+    "fp8_dequant_gvalues_per_second": 455.0,
+    "hbm_kernel_efficiency": 0.5961042492917847,
+    "hbm_stream_gbps": 1765.0,
+    "int4_dequant_gvalues_per_second": 455.0,
+    "nvlink_latency_ms": 0.031,
+    "nvlink_payload_gbps": 274.0,
+    "peak_bf16_tflops": 312.0
+  },
+  "model": "DeepSeek V4 Flash",
+  "model_inputs": {
+    "active_parameters_billions": 13.0,
+    "attention_heads": 64,
+    "cache_layers": 21,
+    "config_commit": "60d8d70770c6776ff598c94bb586a859a38244f1",
+    "config_submodule": "deepseek-v4-flash",
+    "display_name": "DeepSeek V4 Flash",
+    "expert_weight_bits": 4,
+    "experts": 256,
+    "experts_per_token": 6,
+    "full_index_layers": 40,
+    "hidden_size": 4096,
+    "index_dim": 128,
+    "index_heads": 64,
+    "index_pool": 1,
+    "index_topk": 512,
+    "key": "deepseek-flash",
+    "layers": 43,
+    "linear_attention_layers": 0,
+    "lm_head_weight_bits": 8,
+    "moe_intermediate_size": 2048,
+    "moe_layers": 43,
+    "nodes": 1,
+    "nonexpert_weight_bits": 8,
+    "pp_size": 1,
+    "prefill_attention": "compressed-sparse",
+    "qk_head_dim": 64,
+    "replicas": 2,
+    "stored_weight_gb": 159.609485896,
+    "tp_size": 4,
+    "v_head_dim": 512,
+    "vocab_size": 129280
+  },
+  "profiler_version": "GenZ-bridge-1",
+  "source": {
+    "config_commit": "60d8d70770c6776ff598c94bb586a859a38244f1",
+    "config_submodule": "deepseek-v4-flash",
+    "genz_commit": "091bdd0a2777dfe4d405a8fcdd91c8f12b474bf3",
+    "llmservingsim_commit": "a4053bc1161872420e1e0607cb3409ef659b828e"
+  },
+  "tp_degrees": [
+    4
+  ],
+  "variant": "official-dequant-bf16"
+}

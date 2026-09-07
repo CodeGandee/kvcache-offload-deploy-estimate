@@ -1,0 +1,58 @@
+{
+  "hardware": "A100-SXM4-80GB",
+  "hardware_inputs": {
+    "compute_efficiency": 0.4,
+    "fp8_dequant_gvalues_per_second": 455.0,
+    "hbm_kernel_efficiency": 0.5961042492917847,
+    "hbm_stream_gbps": 1765.0,
+    "int4_dequant_gvalues_per_second": 455.0,
+    "nvlink_latency_ms": 0.031,
+    "nvlink_payload_gbps": 274.0,
+    "peak_bf16_tflops": 312.0
+  },
+  "model": "Kimi Code 2.7",
+  "model_inputs": {
+    "active_parameters_billions": 32.0,
+    "attention_heads": 64,
+    "cache_layers": 61,
+    "config_commit": "74797c9c62378b951a1f6fcf5c4631024e9b8bef",
+    "config_submodule": "kimi-k2.7-code",
+    "display_name": "Kimi Code 2.7",
+    "expert_weight_bits": 4,
+    "experts": 384,
+    "experts_per_token": 8,
+    "full_index_layers": 0,
+    "hidden_size": 7168,
+    "index_dim": 0,
+    "index_heads": 0,
+    "index_pool": 1,
+    "index_topk": 0,
+    "key": "kimi",
+    "layers": 61,
+    "linear_attention_layers": 0,
+    "lm_head_weight_bits": 16,
+    "moe_intermediate_size": 2048,
+    "moe_layers": 60,
+    "nodes": 2,
+    "nonexpert_weight_bits": 16,
+    "pp_size": 8,
+    "prefill_attention": "dense-mla",
+    "qk_head_dim": 192,
+    "replicas": 1,
+    "stored_weight_gb": 595.2,
+    "tp_size": 2,
+    "v_head_dim": 128,
+    "vocab_size": 163840
+  },
+  "profiler_version": "GenZ-bridge-1",
+  "source": {
+    "config_commit": "74797c9c62378b951a1f6fcf5c4631024e9b8bef",
+    "config_submodule": "kimi-k2.7-code",
+    "genz_commit": "091bdd0a2777dfe4d405a8fcdd91c8f12b474bf3",
+    "llmservingsim_commit": "a4053bc1161872420e1e0607cb3409ef659b828e"
+  },
+  "tp_degrees": [
+    2
+  ],
+  "variant": "official-dequant-bf16"
+}

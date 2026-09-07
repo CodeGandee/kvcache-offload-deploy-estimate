@@ -45,6 +45,7 @@ Run the LLMServingSim-compatible ShadowKV extension and its 256-sample sensitivi
 study:
 
 ```bash
+pixi run profiles
 pixi run kv-shadowkv-sim --samples 256
 pixi run kv-shadowkv-sim --samples 256 --json
 pixi run kv-shadowkv-sim --oracle-recall 1 --oracle-precision 1 --trust-oracle
@@ -57,9 +58,19 @@ standalone report. The published
 central case deliberately omits `--trust-oracle`, so it still verifies the current
 token with landmarks.
 
-The command imports `_pp_stage_boundaries` from the pinned LLMServingSim checkout,
-so submodules must be initialized. It then emits external per-transformer-block
-ShadowKV trace events without modifying the upstream simulator.
+`pixi run profiles` reads the official tracked model configs, executes the GenZ
+roofline sweep for 1–128 sequences, and writes deterministic
+`per_sequence.csv` bundles under `data/profiles/llmservingsim/`. Each bundle contains
+both total-core rows and PP-stage rows. The report build
+regenerates those profiles automatically. The estimator then reads the profiles
+through LLMServingSim's `_lookup_per_sequence`, imports its
+`_pp_stage_boundaries`, and emits external per-transformer-block ShadowKV events
+without modifying either upstream project.
+
+The Pixi dependency installs GenZ's Python dependency set, while the adapter prepends
+the pinned `extern/tracked/genz-llm-analyzer` checkout to `sys.path`. Consequently the
+roofline implementation executed by the project is the recorded gitlink revision, not
+an untracked site-package copy.
 
 ## External source revisions
 
@@ -92,17 +103,20 @@ case data are embedded directly in the HTML so the file can be opened locally.
 
 ## Simulation boundary
 
-LLMServingSim provides PP partitioning and serving-trace structure. Its checked-in
-profiles do not cover these frontier models on A800, and stock tiered-KV offload does
-not express ShadowKV's landmark/reconstruction path. The extension therefore retains
-the earlier calibrated non-ShadowKV model-forward floor and explicitly simulates only
-the incremental ShadowKV events. A100 measurements replace the PCIe, TP2-pair, FP8-KV
-conversion, and small P2P priors; they do not replace that frontier-model core floor.
-Do not describe the final values as native LLMServingSim predictions, full-model A100
-profiles, or measured A800 results.
+LLMServingSim's checked-in profiles do not cover these frontier models on A800, and
+stock tiered-KV offload does not express ShadowKV's landmark/reconstruction path.
+The project therefore uses GenZ to generate the missing model-core tables from official
+config dimensions and stored precisions. The central hardware envelope combines the
+GenZ A100 compute-efficiency prior with the measured A100 HBM, BF16 GEMM MBU, fused
+dequantization, H2D, and P2P values. LLMServingSim consumes those generated tables and
+provides interpolation and PP partitioning; ShadowKV events are still an external
+adapter. For PP8, the estimator searches microbatch sizes that retain at least eight
+request groups and applies LLMServingSim's pipeline-depth recurrence; this is an
+analytical steady-state schedule rather than an ASTRA-Sim execution.
 
-The load-indexed non-ShadowKV profile is also guarded by the one-user autoregressive
-latency floor for PP placements. This prevents an old capacity-oriented pipeline-fill
-multiplier from making per-user TPOT improve as unrelated requests are admitted. It is
-a conservative guardrail, not a substitute for measured per-stage latency as a
-function of microbatch size.
+This removes the former hand-set model-forward arrays, but it does not turn the result
+into a benchmark. The aggregate GenZ operators assume balanced MoE routing, fused
+weight conversion, a ring-style TP collective, and no framework gaps. The prefill
+model is analytical and no frontier checkpoint was executed. Do not describe the
+values as native upstream LLMServingSim predictions, full-model A100 profiles, or
+measured A800 results.

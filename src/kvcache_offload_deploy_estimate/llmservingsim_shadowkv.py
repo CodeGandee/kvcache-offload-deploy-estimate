@@ -1,13 +1,14 @@
-"""ShadowKV trace extension for LLMServingSim-style decode studies.
+"""ShadowKV trace extension for GenZ-to-LLMServingSim decode studies.
 
 The upstream simulator models ordinary tiered KV blocks.  ShadowKV has a different
 per-transformer-block dependency: landmark selection must finish before cache misses
 are known, key reconstruction and value fetch overlap, and sparse attention waits for
 both.  This module adds those events without modifying the tracked upstream source.
 
-The non-ShadowKV model-forward component is a calibration input.  Everything added by
-this module (selection, prefetch traffic, miss materialization, and FP8 conversion) is
-calculated explicitly and is therefore independently inspectable.
+The non-ShadowKV model-forward component comes from official-config operator graphs
+evaluated by GenZ and consumed through LLMServingSim's profile-table interface.
+Everything added here (selection, prefetch traffic, miss materialization, and FP8 KV
+conversion) is calculated explicitly and is therefore independently inspectable.
 """
 
 from __future__ import annotations
@@ -19,9 +20,23 @@ import statistics
 import sys
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
-from itertools import pairwise
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, cast
+
+from .genz_llmservingsim import (
+    CENTRAL_HARDWARE,
+    GENZ_COMMIT,
+    LLMSERVINGSIM_COMMIT,
+    RooflineHardware,
+    analytical_decode_ms,
+    analytical_decode_stage_ms,
+    analytical_prefill_seconds,
+    decode_breakdown,
+    llmservingsim_decode_ms,
+    llmservingsim_decode_stage_ms,
+    profile_manifest,
+)
 
 PolicyName = Literal["oracle-prefetch", "fetch-at-decode"]
 StorageName = Literal["bf16", "fp8"]
@@ -65,20 +80,41 @@ class A800Host:
 
     hbm_stream_gbps: float = 1765.0
     decode_gemm_mbu: float = 0.516
+    peak_bf16_tflops: float = 312.0
+    bf16_compute_efficiency: float = 0.40
     pcie_per_gpu_gbps: float = 22.0
     pcie_tp2_pair_gbps: float = 25.4
     host_dram_gbps: float = 180.0
     fp8_dequant_gbps: float = 455.0
-    nvlink_latency_ms: float = 0.030
+    int4_dequant_gbps: float = 455.0
+    nvlink_latency_ms: float = 0.031
+    nvlink_payload_gbps: float = 274.0
     ib_latency_ms: float = 0.012
     ib_payload_gbps: float = 40.0
 
 
+def _roofline_hardware(hardware: A800Host) -> RooflineHardware:
+    """Translate the deployment hardware record into GenZ inputs."""
+
+    hbm_efficiency = hardware.decode_gemm_mbu * 2039.0 / hardware.hbm_stream_gbps
+    return RooflineHardware(
+        peak_bf16_tflops=hardware.peak_bf16_tflops,
+        compute_efficiency=hardware.bf16_compute_efficiency,
+        hbm_stream_gbps=hardware.hbm_stream_gbps,
+        hbm_kernel_efficiency=hbm_efficiency,
+        fp8_dequant_gvalues_per_second=hardware.fp8_dequant_gbps,
+        int4_dequant_gvalues_per_second=hardware.int4_dequant_gbps,
+        nvlink_latency_ms=hardware.nvlink_latency_ms,
+        nvlink_payload_gbps=hardware.nvlink_payload_gbps,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Scenario:
-    """One model/context placement and its calibrated non-ShadowKV decode profile."""
+    """One model/context placement backed by a generated core profile."""
 
     id: str
+    model_key: str
     model: str
     context_tokens: int
     max_users: int
@@ -89,9 +125,6 @@ class Scenario:
     tp_size: int
     nodes: int
     replicas: int
-    reference_bf16_tpot_ms: tuple[float, float, float, float, float]
-    ttft_seconds: tuple[float, float, float, float, float]
-    last_ttft_seconds: tuple[float, float, float, float, float]
     weight_per_gpu_gb: float
     mtp_draft_tokens: int = 0
 
@@ -103,37 +136,52 @@ class Scenario:
         loads = tuple(max(1, half_up(self.max_users * load)) for load in (0.25, 0.5, 0.75, 1.0))
         return 1, loads[0], loads[1], loads[2], loads[3]
 
-    def reference_tpot_for_users(self, users: int) -> float:
-        """Interpolate the profile while preserving autoregressive latency causality.
+    def core_tpot_for_sequences(self, sequences: int, hardware: A800Host | None = None) -> float:
+        """Return batch latency from the generated LLMServingSim profile."""
 
-        The original PP8 calibration applied pipeline-fill throughput multipliers
-        directly to per-user TPOT.  That allowed a request to decode faster merely
-        because unrelated requests were present.  Pipeline overlap can raise total
-        throughput, but it cannot shorten the recurrence from one token of a request
-        to its next token.  Use the one-user reference as a latency floor for PP
-        placements; explicit cache and bandwidth work below can still increase TPOT
-        with load.
-        """
+        if sequences < 1:
+            raise ValueError("sequences must be positive")
+        if hardware is None:
+            return llmservingsim_decode_ms(self.model_key, sequences)
+        roofline = _roofline_hardware(hardware)
+        if roofline == CENTRAL_HARDWARE:
+            return llmservingsim_decode_ms(self.model_key, sequences)
+        return analytical_decode_ms(self.model_key, sequences, roofline)
 
+    def reference_tpot_for_users(self, users: int, hardware: A800Host | None = None) -> float:
         if users < 1 or users > self.max_users:
             raise ValueError("users must be between one and the admission ceiling")
-        points = tuple(zip(self.load_users, self.reference_bf16_tpot_ms, strict=True))
-        interpolated: float | None = None
-        for point_users, value in points:
-            if users == point_users:
-                interpolated = value
-                break
-        if interpolated is None:
-            for (left_users, left), (right_users, right) in pairwise(points):
-                if left_users <= users <= right_users:
-                    fraction = (users - left_users) / (right_users - left_users)
-                    interpolated = left + fraction * (right - left)
-                    break
-        if interpolated is None:
-            raise AssertionError("reference interpolation did not bracket the requested load")
-        if self.pp_size > 1:
-            return max(self.reference_bf16_tpot_ms[0], interpolated)
-        return interpolated
+        return self.core_tpot_for_sequences(math.ceil(users / self.replicas), hardware)
+
+    def core_stage_tpot_for_sequences(
+        self, sequences: int, hardware: A800Host | None = None
+    ) -> tuple[float, ...]:
+        """Return the per-stage profile used by the steady PP scheduler."""
+
+        if sequences < 1:
+            raise ValueError("sequences must be positive")
+        if hardware is None:
+            return llmservingsim_decode_stage_ms(self.model_key, sequences)
+        roofline = _roofline_hardware(hardware)
+        if roofline == CENTRAL_HARDWARE:
+            return llmservingsim_decode_stage_ms(self.model_key, sequences)
+        return analytical_decode_stage_ms(self.model_key, sequences, roofline)
+
+    @property
+    def ttft_seconds(self) -> tuple[float, float, float, float, float]:
+        single = analytical_prefill_seconds(self.model_key, self.context_tokens)
+        return cast(
+            tuple[float, float, float, float, float],
+            _burst_ttft(single, self.max_users, self.replicas)[0],
+        )
+
+    @property
+    def last_ttft_seconds(self) -> tuple[float, float, float, float, float]:
+        single = analytical_prefill_seconds(self.model_key, self.context_tokens)
+        return cast(
+            tuple[float, float, float, float, float],
+            _burst_ttft(single, self.max_users, self.replicas)[1],
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,6 +200,7 @@ class TraceEvent:
 class PointEstimate:
     users: int
     users_per_replica: int
+    selected_microbatch: int
     tpot_ms: float
     aggregate_tps: float
     per_user_tps: float
@@ -351,20 +400,6 @@ def _resident_materialize_ms_per_block(
     return dequant_ms
 
 
-def _mtp_core_position_fraction(scenario: Scenario, users: int) -> float:
-    """Fraction of the calibrated non-ShadowKV path that scales per verified position.
-
-    The remainder represents shared weight reads, pipeline launch/bubble time, and
-    communication.  This is an explicit calibration assumption, not an upstream
-    LLMServingSim result.
-    """
-
-    utilization = users / scenario.max_users
-    if scenario.pp_size > 1:
-        return 0.15 + 0.10 * utilization
-    return 0.30 + 0.25 * utilization
-
-
 def _transfer_time_ms(
     *,
     stage_bytes_per_gpu: float,
@@ -397,6 +432,7 @@ def _estimate_once(
     users_override: int | None = None,
     resident_layers: int = 0,
     mtp_accepted_tokens: int = 0,
+    microbatch_override: int | None = None,
 ) -> tuple[float, tuple[TraceEvent, ...]]:
     users = scenario.load_users[load_index] if users_override is None else users_override
     if not 1 <= users <= scenario.max_users:
@@ -413,30 +449,34 @@ def _estimate_once(
     verification_tokens = scenario.mtp_draft_tokens if mtp_accepted_tokens else 1
     emitted_tokens = mtp_accepted_tokens + 1 if mtp_accepted_tokens else 1
     local_users = math.ceil(users / scenario.replicas)
+    if microbatch_override is None:
+        microbatch_override = _optimal_microbatch_size(
+            scenario,
+            users=users,
+            policy=policy,
+            storage=storage,
+            oracle=oracle,
+            reuse=reuse,
+            resident_layers=resident_layers,
+            mtp_accepted_tokens=mtp_accepted_tokens,
+        )
+    if not 1 <= microbatch_override <= local_users:
+        raise ValueError("microbatch size must be within users per replica")
+    batch_users = microbatch_override
+    pipeline_groups = math.ceil(local_users / batch_users)
     layer_counts = stage_layer_counts(scenario.cache_layers, scenario.pp_size)
     resident_counts = _resident_counts_by_stage(layer_counts, resident_layers)
     stage_bytes = _stage_cache_bytes(scenario, storage=storage)
 
-    # Remove the earlier report's simple 80/80 JIT-transfer allowance to obtain
-    # the non-ShadowKV profile floor, then insert the explicit block events below.
-    reference_oracle = OraclePrefetch()
-    _, reference_jit = reference_oracle.traffic_factors(reuse=reuse)
-    reference_jit_ms = sum(
-        _transfer_time_ms(
-            stage_bytes_per_gpu=value * (2.0 / stored_bytes_per_value(storage)),
-            factor=reference_jit,
-            users=local_users,
-            tp_size=scenario.tp_size,
-            hardware=hardware,
-        )
-        for value in stage_bytes
+    # The profile contains only the model-forward path. ShadowKV work is added below,
+    # so no transfer allowance is subtracted from this generated core floor.
+    profile_floor = scenario.core_tpot_for_sequences(batch_users, hardware)
+    verified_core_stages = scenario.core_stage_tpot_for_sequences(
+        batch_users * verification_tokens, hardware
     )
-    reference_tpot = scenario.reference_tpot_for_users(users)
-    profile_floor = max(0.1, reference_tpot - reference_jit_ms)
-    core_scale = 1.0 + _mtp_core_position_fraction(scenario, users) * (verification_tokens - 1)
 
     events: list[TraceEvent] = []
-    selector_block = selector_ms_per_block(local_users, scenario.context_tokens) * selector_scale
+    selector_block = selector_ms_per_block(batch_users, scenario.context_tokens) * selector_scale
     if policy == "oracle-prefetch":
         prefetch_factor, jit_factor = oracle.traffic_factors(reuse=reuse)
         miss_fraction = jit_factor
@@ -445,7 +485,7 @@ def _estimate_once(
         miss_fraction = 1.0 - reuse
 
     materialize_block, _, _ = _paper_materialize_ms_per_block(
-        users=local_users,
+        users=batch_users,
         context_tokens=scenario.context_tokens,
         cached_width=scenario.cached_width,
         miss_fraction=miss_fraction,
@@ -455,7 +495,7 @@ def _estimate_once(
     materialize_block *= materialize_scale
     resident_materialize_block = (
         _resident_materialize_ms_per_block(
-            users=local_users,
+            users=batch_users,
             context_tokens=scenario.context_tokens,
             cached_width=scenario.cached_width,
             miss_fraction=miss_fraction,
@@ -470,10 +510,10 @@ def _estimate_once(
     extra_resident_materialize_block = 0.0
     extra_transfer_factor = 0.0
     if verification_tokens > 1:
-        extra_users = local_users * (verification_tokens - 1)
+        extra_users = batch_users * (verification_tokens - 1)
         extra_selector_block = (
-            selector_ms_per_block(local_users * verification_tokens, scenario.context_tokens)
-            - selector_ms_per_block(local_users, scenario.context_tokens)
+            selector_ms_per_block(batch_users * verification_tokens, scenario.context_tokens)
+            - selector_ms_per_block(batch_users, scenario.context_tokens)
         ) * selector_scale
         extra_materialize_block, _, _ = _paper_materialize_ms_per_block(
             users=extra_users,
@@ -497,7 +537,7 @@ def _estimate_once(
         )
         extra_transfer_factor = (verification_tokens - 1) * (1.0 - reuse)
 
-    critical_added = 0.0
+    stage_critical_times: list[float] = []
     for stage, (layers, resident, bytes_for_stage) in enumerate(
         zip(layer_counts, resident_counts, stage_bytes, strict=True)
     ):
@@ -509,7 +549,7 @@ def _estimate_once(
         transfer = _transfer_time_ms(
             stage_bytes_per_gpu=bytes_for_stage * offloaded / layers,
             factor=miss_fraction,
-            users=local_users,
+            users=batch_users,
             tp_size=scenario.tp_size,
             hardware=hardware,
         )
@@ -523,13 +563,13 @@ def _estimate_once(
         extra_transfer = _transfer_time_ms(
             stage_bytes_per_gpu=bytes_for_stage * offloaded / layers,
             factor=extra_transfer_factor,
-            users=local_users,
+            users=batch_users,
             tp_size=scenario.tp_size,
             hardware=hardware,
         )
         extra_materialize = max(extra_materialize, extra_transfer)
         stage_critical = selection + materialize + extra_selection + extra_materialize
-        critical_added += stage_critical
+        stage_critical_times.append(stage_critical)
         events.append(
             TraceEvent(
                 stage=stage,
@@ -545,7 +585,7 @@ def _estimate_once(
                     * offloaded
                     / layers
                     * (miss_fraction + extra_transfer_factor)
-                    * local_users
+                    * batch_users
                 ),
             )
         )
@@ -559,7 +599,7 @@ def _estimate_once(
             zip(layer_counts, resident_counts, stage_bytes, strict=True)
         ):
             node = min(scenario.nodes - 1, stage * scenario.nodes // scenario.pp_size)
-            moved = bytes_for_stage * (layers - resident) / layers * prefetch_factor * local_users
+            moved = bytes_for_stage * (layers - resident) / layers * prefetch_factor * batch_users
             node_bytes[node] += moved * scenario.tp_size
             per_gpu_times.append(moved / (hardware.pcie_per_gpu_gbps * 1e9) * 1000.0)
             if scenario.tp_size == 2:
@@ -584,20 +624,27 @@ def _estimate_once(
                 default=0.0,
             ),
         )
-        # One-token lookahead has the preceding token's non-ShadowKV forward time
-        # as its overlap window.  More lookahead scales that window linearly.
-        overlap_window = profile_floor * oracle.lookahead_tokens
-        background_stall = max(0.0, background_service - overlap_window)
+        # A steady PP schedule admits one microbatch per stage cadence. Across
+        # one recurrence, every request group contributes one prefetch payload.
+        # The transfer can overlap compute, but its node service demand must fit.
+        background_stall = background_service * pipeline_groups / oracle.lookahead_tokens
 
-    communication = 0.0
+    stage_communications = [0.0] * scenario.pp_size
     if scenario.pp_size > 1:
-        communication = (scenario.pp_size - scenario.nodes) * hardware.nvlink_latency_ms
-        communication += (scenario.nodes - 1) * hardware.ib_latency_ms
+        for stage in range(scenario.pp_size - 1):
+            source_node = min(scenario.nodes - 1, stage * scenario.nodes // scenario.pp_size)
+            target_node = min(scenario.nodes - 1, (stage + 1) * scenario.nodes // scenario.pp_size)
+            stage_communications[stage] = (
+                hardware.ib_latency_ms if source_node != target_node else hardware.nvlink_latency_ms
+            )
     mtp_draft = 0.0
     if verification_tokens > 1:
-        draft_core = profile_floor * verification_tokens * 1.5 / scenario.model_layers
+        # One checkpoint MTP block per config. Its active path is approximated by
+        # one full-model layer, while the target verification itself comes from the
+        # generated profile at the enlarged token batch above.
+        draft_core = profile_floor * verification_tokens / scenario.model_layers
         draft_materialize, _, _ = _paper_materialize_ms_per_block(
-            users=local_users,
+            users=batch_users,
             context_tokens=scenario.context_tokens,
             cached_width=scenario.cached_width,
             miss_fraction=1.0 - reuse,
@@ -615,14 +662,67 @@ def _estimate_once(
             )
         )
 
-    round_total = (
-        profile_floor * core_scale + critical_added + background_stall + communication + mtp_draft
-    )
-    return round_total / emitted_tokens, tuple(events)
+    stage_critical_times[-1] += mtp_draft
+    stage_services = [
+        core + shadow + communication
+        for core, shadow, communication in zip(
+            verified_core_stages, stage_critical_times, stage_communications, strict=True
+        )
+    ]
+    # LLMServingSim caps in-flight batches at PP depth. With fewer groups, a
+    # group's next token waits for its own P-stage traversal; with more groups,
+    # queued groups determine the recurrence. The scheduler selects the central
+    # microbatch size that minimizes this steady-state recurrence.
+    compute_recurrence = max(scenario.pp_size, pipeline_groups) * max(stage_services)
+    round_recurrence = max(compute_recurrence, background_stall)
+    return round_recurrence / emitted_tokens, tuple(events)
 
 
 DEFAULT_ORACLE = OraclePrefetch()
 DEFAULT_HARDWARE = A800Host()
+
+
+@lru_cache(maxsize=8192)
+def _optimal_microbatch_size(
+    scenario: Scenario,
+    *,
+    users: int,
+    policy: PolicyName,
+    storage: StorageName,
+    oracle: OraclePrefetch,
+    reuse: float,
+    resident_layers: int,
+    mtp_accepted_tokens: int,
+) -> int:
+    """Choose the central steady-state PP microbatch size.
+
+    There is no advantage to using fewer groups than PP stages: it leaves
+    stages idle while increasing each stage's batch work. Therefore the
+    bounded search ends at ``ceil(users_per_replica / pp_size)``. PP=1 keeps
+    the entire continuous batch together.
+    """
+
+    local_users = math.ceil(users / scenario.replicas)
+    if scenario.pp_size == 1:
+        return local_users
+    maximum = math.ceil(local_users / scenario.pp_size)
+    candidates = range(1, maximum + 1)
+    return min(
+        candidates,
+        key=lambda microbatch: _estimate_once(
+            scenario,
+            load_index=0,
+            policy=policy,
+            storage=storage,
+            oracle=oracle,
+            reuse=reuse,
+            hardware=DEFAULT_HARDWARE,
+            users_override=users,
+            resident_layers=resident_layers,
+            mtp_accepted_tokens=mtp_accepted_tokens,
+            microbatch_override=microbatch,
+        )[0],
+    )
 
 
 def estimate_point(
@@ -658,11 +758,17 @@ def estimate_point(
     samples: list[float] = []
     for _ in range(max(0, sensitivity_samples)):
         sample_hardware = A800Host(
+            hbm_stream_gbps=rng.triangular(1700.0, 1810.0, hardware.hbm_stream_gbps),
+            decode_gemm_mbu=rng.triangular(0.307, 0.618, hardware.decode_gemm_mbu),
+            peak_bf16_tflops=hardware.peak_bf16_tflops,
+            bf16_compute_efficiency=rng.triangular(0.30, 0.55, hardware.bf16_compute_efficiency),
             pcie_per_gpu_gbps=rng.triangular(20.5, 23.5, hardware.pcie_per_gpu_gbps),
             pcie_tp2_pair_gbps=rng.triangular(23.0, 28.0, hardware.pcie_tp2_pair_gbps),
             host_dram_gbps=rng.triangular(130.0, 220.0, hardware.host_dram_gbps),
             fp8_dequant_gbps=rng.triangular(320.0, 520.0, hardware.fp8_dequant_gbps),
+            int4_dequant_gbps=rng.triangular(280.0, 520.0, hardware.int4_dequant_gbps),
             nvlink_latency_ms=hardware.nvlink_latency_ms,
+            nvlink_payload_gbps=rng.triangular(240.0, 300.0, hardware.nvlink_payload_gbps),
             ib_latency_ms=hardware.ib_latency_ms,
             ib_payload_gbps=hardware.ib_payload_gbps,
         )
@@ -690,9 +796,20 @@ def estimate_point(
 
     users = scenario.load_users[load_index] if users_override is None else users_override
     aggregate = 1000.0 * users / central
+    selected_microbatch = _optimal_microbatch_size(
+        scenario,
+        users=users,
+        policy=policy,
+        storage=storage,
+        oracle=oracle,
+        reuse=reuse,
+        resident_layers=resident_layers,
+        mtp_accepted_tokens=mtp_accepted_tokens,
+    )
     return PointEstimate(
         users=users,
         users_per_replica=math.ceil(users / scenario.replicas),
+        selected_microbatch=selected_microbatch,
         tpot_ms=central,
         aggregate_tps=aggregate,
         per_user_tps=1000.0 / central,
@@ -767,152 +884,63 @@ def _burst_ttft(
 
 
 SCENARIOS: tuple[Scenario, ...] = (
+    Scenario("kimi-72", "kimi", "Kimi Code 2.7", 73_728, 48, 61, 61, 576, 8, 2, 2, 1, 37.2, 0),
+    Scenario("kimi-128", "kimi", "Kimi Code 2.7", 131_072, 28, 61, 61, 576, 8, 2, 2, 1, 37.2, 0),
+    Scenario("kimi-256", "kimi", "Kimi Code 2.7", 262_144, 14, 61, 61, 576, 8, 2, 2, 1, 37.2, 0),
+    Scenario("glm-72", "glm", "GLM-5.3", 73_728, 48, 78, 78, 576, 8, 2, 2, 1, 47.225, 3),
+    Scenario("glm-128", "glm", "GLM-5.3", 131_072, 40, 78, 78, 576, 8, 2, 2, 1, 47.225, 3),
+    Scenario("glm-256", "glm", "GLM-5.3", 262_144, 30, 78, 78, 576, 8, 2, 2, 1, 47.225, 3),
     Scenario(
-        "kimi-128",
-        "Kimi Code 2.7",
-        131_072,
-        28,
-        61,
-        61,
-        576,
-        8,
-        2,
-        2,
+        "glm-flash-72",
+        "glm-flash",
+        "GLM-5.3-Flash",
+        73_728,
+        80,
+        45,
+        11,
+        512,
         1,
-        (166.7, 73.7, 66.4, 71.2, 79.3),
-        (16.6, 66.4, 124.5, 182.6, 240.7),
-        (16.6, 116.2, 232.4, 348.6, 464.8),
-        37.2,
-        0,
+        8,
+        1,
+        1,
+        328.326771576 / 8,
+        2,
     ),
     Scenario(
-        "kimi-256",
-        "Kimi Code 2.7",
-        262_144,
-        14,
-        61,
-        61,
-        576,
-        8,
-        2,
-        2,
-        1,
-        (200.0, 133.3, 90.9, 85.3, 81.9),
-        (43.2, 108.0, 172.8, 259.2, 324.0),
-        (43.2, 172.8, 302.4, 475.2, 604.8),
-        37.2,
-        0,
-    ),
-    Scenario(
-        "glm-128",
-        "GLM-5.3",
-        131_072,
-        40,
-        78,
-        78,
-        576,
-        8,
-        2,
-        2,
-        1,
-        (333.3, 129.9, 127.4, 138.9, 153.8),
-        (14.3, 78.7, 150.2, 221.7, 293.2),
-        (14.3, 143.0, 286.0, 429.0, 572.0),
-        47.225,
-        3,
-    ),
-    Scenario(
-        "glm-256",
-        "GLM-5.3",
-        262_144,
-        30,
-        78,
-        78,
-        576,
-        8,
-        2,
-        2,
-        1,
-        (500.0, 142.9, 123.9, 130.7, 142.2),
-        (28.7, 129.2, 229.6, 344.4, 444.9),
-        (28.7, 229.6, 430.5, 660.1, 861.0),
-        47.225,
-        3,
-    ),
-    Scenario(
-        "flash-128",
-        "DeepSeek V4 Flash",
+        "glm-flash-128",
+        "glm-flash",
+        "GLM-5.3-Flash",
         131_072,
         64,
-        43,
-        21,
+        45,
+        11,
         512,
         1,
-        4,
+        8,
         1,
-        2,
-        (24.4, 56.7, 79.4, 101.0, 124.5),
-        (7.3, 32.8, 61.9, 91.0, 120.1),
-        (7.3, 58.2, 116.5, 174.7, 232.9),
-        39.9,
+        1,
+        328.326771576 / 8,
         2,
     ),
     Scenario(
-        "flash-256",
-        "DeepSeek V4 Flash",
+        "glm-flash-256",
+        "glm-flash",
+        "GLM-5.3-Flash",
         262_144,
         48,
-        43,
-        21,
+        45,
+        11,
         512,
         1,
-        4,
-        1,
-        2,
-        (27.8, 53.1, 71.4, 89.4, 109.9),
-        (14.6, 51.0, 94.6, 138.3, 182.0),
-        (14.6, 87.4, 174.7, 262.1, 349.4),
-        39.9,
-        2,
-    ),
-    Scenario(
-        "kimi-72",
-        "Kimi Code 2.7",
-        73_728,
-        48,
-        61,
-        61,
-        576,
         8,
-        2,
-        2,
         1,
-        (150.0, 61.0, 56.0, 59.0, 65.0),
-        cast(tuple[float, float, float, float, float], _burst_ttft(7.5, 48, 1)[0]),
-        cast(tuple[float, float, float, float, float], _burst_ttft(7.5, 48, 1)[1]),
-        37.2,
-        0,
-    ),
-    Scenario(
-        "glm-72",
-        "GLM-5.3",
-        73_728,
-        48,
-        78,
-        78,
-        576,
-        8,
-        2,
-        2,
         1,
-        (300.0, 115.0, 112.0, 122.0, 137.0),
-        cast(tuple[float, float, float, float, float], _burst_ttft(8.0, 48, 1)[0]),
-        cast(tuple[float, float, float, float, float], _burst_ttft(8.0, 48, 1)[1]),
-        47.225,
-        3,
+        328.326771576 / 8,
+        2,
     ),
     Scenario(
         "flash-72",
+        "deepseek-flash",
         "DeepSeek V4 Flash",
         73_728,
         80,
@@ -923,9 +951,38 @@ SCENARIOS: tuple[Scenario, ...] = (
         4,
         1,
         2,
-        (21.0, 50.0, 72.0, 94.0, 116.0),
-        cast(tuple[float, float, float, float, float], _burst_ttft(4.1, 80, 2)[0]),
-        cast(tuple[float, float, float, float, float], _burst_ttft(4.1, 80, 2)[1]),
+        39.9,
+        2,
+    ),
+    Scenario(
+        "flash-128",
+        "deepseek-flash",
+        "DeepSeek V4 Flash",
+        131_072,
+        64,
+        43,
+        21,
+        512,
+        1,
+        4,
+        1,
+        2,
+        39.9,
+        2,
+    ),
+    Scenario(
+        "flash-256",
+        "deepseek-flash",
+        "DeepSeek V4 Flash",
+        262_144,
+        48,
+        43,
+        21,
+        512,
+        1,
+        4,
+        1,
+        2,
         39.9,
         2,
     ),
@@ -951,6 +1008,10 @@ def build_report(
             "stage_layer_counts": stage_layer_counts(scenario.cache_layers, scenario.pp_size),
             "ttft_seconds": scenario.ttft_seconds,
             "last_ttft_seconds": scenario.last_ttft_seconds,
+            "core_profile_ms": tuple(
+                scenario.reference_tpot_for_users(users) for users in scenario.load_users
+            ),
+            "core_single_user_breakdown": decode_breakdown(scenario.model_key, 1),
             "results": {},
         }
         for storage in ("bf16", "fp8"):
@@ -974,9 +1035,14 @@ def build_report(
     return {
         "schema_version": 1,
         "engine": {
-            "name": "LLMServingSim 2.0 + external ShadowKV trace extension",
-            "upstream_commit": "a4053bc1161872420e1e0607cb3409ef659b828e",
-            "integration": "upstream _pp_stage_boundaries plus added per-block trace events",
+            "name": "GenZ roofline → LLMServingSim profile tables → ShadowKV trace extension",
+            "genz_commit": GENZ_COMMIT,
+            "upstream_commit": LLMSERVINGSIM_COMMIT,
+            "integration": (
+                "official-config GenZ operators written to per_sequence.csv; "
+                "LLMServingSim _lookup_per_sequence and _pp_stage_boundaries; "
+                "external per-block ShadowKV events"
+            ),
         },
         "shadowkv": {
             "selection_fraction": 1.0 / 64.0,
@@ -995,10 +1061,12 @@ def build_report(
             "artifact": "benchmarks/a100-sxm4/results/a100-sxm4-80gb-gpu2-3.json",
             "hbm_stream_gbps": DEFAULT_HARDWARE.hbm_stream_gbps,
             "representative_bf16_gemm_mbu": DEFAULT_HARDWARE.decode_gemm_mbu,
+            "bf16_compute_efficiency": DEFAULT_HARDWARE.bf16_compute_efficiency,
             "h2d_single_gpu_gbps": DEFAULT_HARDWARE.pcie_per_gpu_gbps,
             "h2d_concurrent_tp2_pair_gbps": DEFAULT_HARDWARE.pcie_tp2_pair_gbps,
             "fp8_dequant_gvalues_per_second": DEFAULT_HARDWARE.fp8_dequant_gbps,
-            "model_core_floor": "not replaced; no frontier-model kernels or weights were run",
+            "model_core_floor": "replaced by GenZ-generated LLMServingSim profile rows",
+            "profile_manifest": profile_manifest(),
         },
         "series": series,
     }
@@ -1007,6 +1075,7 @@ def build_report(
 def _compact_point(point: PointEstimate) -> dict[str, float | int]:
     return {
         "users": point.users,
+        "microbatch": point.selected_microbatch,
         "tpot": round(point.tpot_ms, 4),
         "tps": round(point.aggregate_tps, 4),
         "userTps": round(point.per_user_tps, 4),
@@ -1033,6 +1102,9 @@ def build_interactive_dataset(*, sensitivity_samples: int = 256) -> dict[str, An
             "mtpDraft": scenario.mtp_draft_tokens,
             "ttft": scenario.ttft_seconds,
             "last": scenario.last_ttft_seconds,
+            "core": [
+                round(scenario.reference_tpot_for_users(users), 4) for users in scenario.load_users
+            ],
             "base": {},
             "mtp": {},
             "residency": {},
@@ -1107,7 +1179,7 @@ def build_interactive_dataset(*, sensitivity_samples: int = 256) -> dict[str, An
             cast(dict[str, Any], item["residency"])[storage] = residency_storage
         series.append(item)
     return {
-        "schemaVersion": 2,
+        "schemaVersion": 4,
         "loads": [0, 25, 50, 75, 100],
         "residencyLoads": list(residency_loads),
         "residencyRequested": list(range(0, 101, 10)),
@@ -1123,10 +1195,12 @@ def build_interactive_dataset(*, sensitivity_samples: int = 256) -> dict[str, An
                 "artifact": "benchmarks/a100-sxm4/results/a100-sxm4-80gb-gpu2-3.json",
                 "hbmStreamGBps": DEFAULT_HARDWARE.hbm_stream_gbps,
                 "representativeBF16GemmMBU": DEFAULT_HARDWARE.decode_gemm_mbu,
+                "bf16ComputeEfficiency": DEFAULT_HARDWARE.bf16_compute_efficiency,
                 "h2dSingleGPU_GBps": DEFAULT_HARDWARE.pcie_per_gpu_gbps,
                 "h2dConcurrentTP2Pair_GBps": DEFAULT_HARDWARE.pcie_tp2_pair_gbps,
                 "fp8DequantGvaluesPerSecond": DEFAULT_HARDWARE.fp8_dequant_gbps,
-                "modelCoreFloorReplaced": False,
+                "modelCoreFloorReplaced": True,
+                "profileManifest": profile_manifest(),
             },
         },
     }

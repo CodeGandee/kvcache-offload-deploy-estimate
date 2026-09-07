@@ -14,6 +14,9 @@ does not vendor model weights.
 | `deepseek-v4-flash` | V4 Flash checkpoint metadata and source/configuration | `60d8d70770c6776ff598c94bb586a859a38244f1` |
 | `llama-models` | Llama 3.1 reference model code | `0e0b8c519242d5833d8c11bffc1232b77ad7f301` |
 | `llmservingsim` | Serving-trace conventions and vLLM-compatible PP partitioning | `a4053bc1161872420e1e0607cb3409ef659b828e` |
+| `genz-llm-analyzer` | Operator roofline implementation used to generate model-core profiles | `091bdd0a2777dfe4d405a8fcdd91c8f12b474bf3` |
+| `glm-5.3` | Official GLM-5.3 checkpoint metadata and config | `aca966e4e02791568aa6a4ced368624b3d897f42` |
+| `glm-5.3-flash` | Official GLM-5.3-Flash checkpoint metadata and config | `eb9eb208eb0d988989d07a6a12d0fdeb5f52574a` |
 
 Clone without large Git LFS payloads:
 
