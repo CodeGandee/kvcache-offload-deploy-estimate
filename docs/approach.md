@@ -146,6 +146,25 @@ runtime groups \(g\) requests per microbatch, use \(m=\lceil C/g\rceil\), which
 increases bubbles. Successive tokens from one user cannot fill the pipeline because
 token \(t+1\) depends on token \(t\).
 
+The ratio above is a **capacity multiplier**, not an inverse per-user-latency
+multiplier. An earlier revision applied it directly to TPOT and incorrectly made a
+GLM request decode faster when unrelated requests were added. For every PP placement,
+the implementation now imposes the autoregressive recurrence floor
+
+\[
+T_{\mathrm{ref}}(C)=
+\max\!\left[T_{\mathrm{ref,raw}}(C),T_{\mathrm{ref,raw}}(1)\right],
+\qquad P>1.
+\]
+
+The explicit selector, materialization, transfer, and dequantization terms still grow
+with active requests. Consequently, PP8 total throughput can rise as stages become
+occupied, while per-user throughput cannot exceed the one-user path. This is a
+conservative correction until batch-size-dependent stage timings are measured; a
+future measured model should replace the floor with
+\(T_{\mathrm{cycle}}=\max(m,P)t_{\mathrm{stage}}(g)\), where both microbatch count
+\(m\) and microbatch size \(g\) are explicit.
+
 The eight stages must be balanced by measured time, not merely by layer count. The
 slowest stage sets pipeline cadence, especially for heterogeneous MoE blocks.
 

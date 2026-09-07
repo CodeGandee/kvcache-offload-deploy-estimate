@@ -118,7 +118,8 @@ def pp8_to_pp2_throughput_ratio(
     Both layouts occupy 16 GPUs and have the same asymptotic two-node capacity.
     The ratio therefore comes from pipeline bubbles, with a small TP2 collective
     credit. The one-user point includes the extra stage-handoff penalty used in
-    the report.
+    the report. This is a capacity ratio; it must not be inverted and applied as
+    a per-user TPOT multiplier.
     """
 
     if microbatches <= 0:

@@ -101,19 +101,36 @@ class Scenario:
         return 1, loads[0], loads[1], loads[2], loads[3]
 
     def reference_tpot_for_users(self, users: int) -> float:
-        """Linearly interpolate the calibrated core profile at an arbitrary load."""
+        """Interpolate the profile while preserving autoregressive latency causality.
+
+        The original PP8 calibration applied pipeline-fill throughput multipliers
+        directly to per-user TPOT.  That allowed a request to decode faster merely
+        because unrelated requests were present.  Pipeline overlap can raise total
+        throughput, but it cannot shorten the recurrence from one token of a request
+        to its next token.  Use the one-user reference as a latency floor for PP
+        placements; explicit cache and bandwidth work below can still increase TPOT
+        with load.
+        """
 
         if users < 1 or users > self.max_users:
             raise ValueError("users must be between one and the admission ceiling")
         points = tuple(zip(self.load_users, self.reference_bf16_tpot_ms, strict=True))
+        interpolated: float | None = None
         for point_users, value in points:
             if users == point_users:
-                return value
-        for (left_users, left), (right_users, right) in pairwise(points):
-            if left_users <= users <= right_users:
-                fraction = (users - left_users) / (right_users - left_users)
-                return left + fraction * (right - left)
-        raise AssertionError("reference interpolation did not bracket the requested load")
+                interpolated = value
+                break
+        if interpolated is None:
+            for (left_users, left), (right_users, right) in pairwise(points):
+                if left_users <= users <= right_users:
+                    fraction = (users - left_users) / (right_users - left_users)
+                    interpolated = left + fraction * (right - left)
+                    break
+        if interpolated is None:
+            raise AssertionError("reference interpolation did not bracket the requested load")
+        if self.pp_size > 1:
+            return max(self.reference_bf16_tpot_ms[0], interpolated)
+        return interpolated
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,11 +423,7 @@ def _estimate_once(
         )
         for value in stage_bytes
     )
-    reference_tpot = (
-        scenario.reference_bf16_tpot_ms[load_index]
-        if users_override is None
-        else scenario.reference_tpot_for_users(users)
-    )
+    reference_tpot = scenario.reference_tpot_for_users(users)
     profile_floor = max(0.1, reference_tpot - reference_jit_ms)
     core_scale = 1.0 + _mtp_core_position_fraction(scenario, users) * (verification_tokens - 1)
 

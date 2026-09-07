@@ -1,10 +1,14 @@
 """Tests for the LLMServingSim-compatible ShadowKV event model."""
 
+from itertools import pairwise
+
 import pytest
 
 from kvcache_offload_deploy_estimate.llmservingsim_shadowkv import (
     SCENARIOS,
     OraclePrefetch,
+    PolicyName,
+    StorageName,
     estimate_point,
     estimate_residency_scan,
     residency_scan,
@@ -169,3 +173,46 @@ def test_mtp_requires_checkpoint_component_and_two_accepts_beat_one() -> None:
         mtp_accepted_tokens=2,
     )
     assert two.tpot_ms < one.tpot_ms
+
+
+@pytest.mark.parametrize(
+    "scenario_id", ["kimi-72", "kimi-128", "kimi-256", "glm-72", "glm-128", "glm-256"]
+)
+@pytest.mark.parametrize("policy", ["oracle-prefetch", "fetch-at-decode"])
+@pytest.mark.parametrize("storage", ["bf16", "fp8"])
+def test_pp8_per_user_throughput_does_not_improve_with_load(
+    scenario_id: str,
+    policy: PolicyName,
+    storage: StorageName,
+) -> None:
+    scenario = next(item for item in SCENARIOS if item.id == scenario_id)
+    points = [
+        estimate_point(
+            scenario,
+            load_index=index,
+            policy=policy,
+            storage=storage,
+            sensitivity_samples=0,
+        )
+        for index in range(5)
+    ]
+    assert all(right.per_user_tps <= left.per_user_tps for left, right in pairwise(points))
+
+
+def test_pp8_reference_floor_also_applies_to_interpolated_residency_loads() -> None:
+    scenario = next(item for item in SCENARIOS if item.id == "glm-128")
+    assert scenario.reference_tpot_for_users(20) == scenario.reference_bf16_tpot_ms[0]
+    assert scenario.reference_tpot_for_users(17) == scenario.reference_bf16_tpot_ms[0]
+
+    scans = [
+        estimate_residency_scan(
+            scenario,
+            users=users,
+            policy="oracle-prefetch",
+            storage="fp8",
+        )
+        for users in (1, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40)
+    ]
+    for residency_index in range(len(scans[0])):
+        per_user = [scan[residency_index].estimate.per_user_tps for scan in scans]
+        assert all(right <= left for left, right in pairwise(per_user))

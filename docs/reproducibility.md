@@ -64,7 +64,8 @@ The gitlinks pin exact source/metadata commits. See `extern/tracked/README.md` a
 timing cases, the PP8×TP2 topology, 72K data, MTP cases, whole-layer residency controls,
 and central result markers. Unit tests verify pipeline fill, sparse working-set size,
 MTP acceptance accounting, whole-layer ratio rounding, resident-HBM payload removal,
-per-GPU layout invariance, and TTFT formulas.
+per-GPU layout invariance, the PP8 one-user latency floor across every GLM residency
+point, and TTFT formulas.
 
 The report is standalone except for KaTeX assets loaded from jsDelivr. Its charts and
 case data are embedded directly in the HTML so the file can be opened locally.
@@ -77,3 +78,9 @@ not express ShadowKV's landmark/reconstruction path. The extension therefore ret
 the earlier calibrated non-ShadowKV model-forward floor and explicitly simulates only
 the incremental ShadowKV events. Do not describe these values as native LLMServingSim
 predictions or measured A800 results.
+
+The load-indexed non-ShadowKV profile is also guarded by the one-user autoregressive
+latency floor for PP placements. This prevents an old capacity-oriented pipeline-fill
+multiplier from making per-user TPOT improve as unrelated requests are admitted. It is
+a conservative guardrail, not a substitute for measured per-stage latency as a
+function of microbatch size.
