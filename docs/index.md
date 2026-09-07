@@ -20,6 +20,8 @@ The first published case covers:
 - ShadowKV-style 1.56% cache selection.
 - An advisory token-ahead oracle with 80% recall/precision and a fetch-at-decode case,
   both with 60% temporal reuse.
+- A no-ShadowKV control that preserves native attention/cache compression, keeps all
+  growing state in HBM, and rejects new requests at the memory-only admission limit.
 - Separate native-MTP plots for one and two mean consecutively accepted draft tokens.
 - Whole-layer exact-KV HBM residency from 0% through 100%, with a one-user/10%-step
   load slider and explicit HBM-feasibility markers.

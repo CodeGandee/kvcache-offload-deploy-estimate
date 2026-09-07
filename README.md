@@ -9,10 +9,16 @@ context on one or two 8×NVIDIA A800 80 GB servers. Kimi Code 2.7 and GLM-5.3 us
 PP8×TP2 across two 400 Gb/s InfiniBand-connected servers; GLM-5.3-Flash uses one TP8
 replica; DeepSeek V4 Flash uses two four-GPU replicas on one server.
 
+The same report also contains a no-ShadowKV control. It keeps each model's complete
+native growing attention state in HBM, retains native DSA/KDA/compressed-attention
+behavior, and rejects the first request beyond a memory-only whole-request ceiling.
+
 The current pipeline reads official model configs, derives roofline service times with
-GenZ, serializes a 1–128-sequence sweep in LLMServingSim profile format, then adds the
-ShadowKV selection, reconstruction, transfer, overlap, MTP, and residency events. It
-contains no manually selected model-forward latency curve.
+GenZ, serializes a 1–1,152-sequence sweep in LLMServingSim profile format, then adds the
+ShadowKV selection, reconstruction, transfer, overlap, MTP, and residency events. The
+extended sweep lets the full-resident control model high compressed-cache concurrency
+without clamping. Its native-attention term is an explicit compute/HBM/dequant
+roofline. The project contains no manually selected model-forward latency curve.
 
 > These are simulation-assisted planning centers, not measured A800 benchmarks. Read the
 > uncertainty section before using the numbers for capacity commitments.

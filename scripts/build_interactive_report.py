@@ -35,7 +35,7 @@ def main() -> None:
         bootstrap = f"""      const reportData =
         {replacement};
       const loads = reportData.loads;
-      let caseMode = location.hash.includes('fetch-at-decode') ? 'fetch' : 'ahead';
+      let caseMode = location.hash.includes('no-shadowkv') ? 'noShadow' : location.hash.includes('fetch-at-decode') ? 'fetch' : 'ahead';
       let storageMode = location.hash.includes('fp8-kv') ? 'fp8' : 'bf16';
       const seriesOrder = ['kimi-72','kimi-128','kimi-256','glm-72','glm-128','glm-256','glm-flash-72','glm-flash-128','glm-flash-256','flash-72','flash-128','flash-256'];
       const seriesColors = Object.fromEntries(seriesOrder.map((id,index) => [id,`var(--s${{index + 1}})`]));

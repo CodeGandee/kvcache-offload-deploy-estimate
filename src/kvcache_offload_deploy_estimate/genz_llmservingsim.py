@@ -85,6 +85,10 @@ class FrontierModelSpec:
     expert_weight_bits: int
     lm_head_weight_bits: int
     prefill_attention: str
+    layer_types: tuple[str, ...]
+    indexer_types: tuple[str, ...]
+    compress_ratios: tuple[int, ...]
+    sliding_window: int
 
     @property
     def active_parameters(self) -> float:
@@ -192,11 +196,14 @@ def _verified_spec(
     indexed_size = index.get("metadata", {}).get("total_size")
     if indexed_size is not None and not math.isclose(float(indexed_size), stored_gb * 1e9):
         raise ValueError(f"{display_name} stored-byte assumption disagrees with official index")
-    qk_raw = (
-        config.get("qk_head_dim")
-        or (int(config.get("qk_nope_head_dim") or 0) + int(config.get("qk_rope_head_dim") or 0))
-        or config.get("head_dim")
-    )
+    if config.get("qk_head_dim") is not None:
+        qk_raw = config["qk_head_dim"]
+    elif config.get("qk_nope_head_dim") is not None:
+        qk_raw = int(config["qk_nope_head_dim"]) + int(config.get("qk_rope_head_dim") or 0)
+    else:
+        # Some implementations expose only a full latent head dimension and a
+        # RoPE sub-dimension. The latter is part of, not the entirety of, Q/K.
+        qk_raw = config.get("head_dim")
     v_raw = config.get("v_head_dim") or config.get("head_dim")
     qk_dim = int(cast(str | int | float, qk_raw))
     v_dim = int(cast(str | int | float, v_raw))
@@ -211,6 +218,12 @@ def _verified_spec(
             raise ValueError(
                 f"{display_name} cache-layer assumption disagrees with official config"
             )
+    indexer_types = tuple(cast(list[str], config.get("indexer_types") or []))
+    compress_ratios = tuple(int(value) for value in config.get("compress_ratios") or [])
+    if indexer_types and len(indexer_types) < layers:
+        raise ValueError(f"{display_name} indexer-type list is shorter than its layer count")
+    if compress_ratios and len(compress_ratios) < layers:
+        raise ValueError(f"{display_name} compression-ratio list is shorter than its layer count")
     return FrontierModelSpec(
         key=key,
         display_name=display_name,
@@ -243,6 +256,10 @@ def _verified_spec(
         expert_weight_bits=expert_bits,
         lm_head_weight_bits=lm_head_bits,
         prefill_attention=prefill_attention,
+        layer_types=tuple(layer_types),
+        indexer_types=indexer_types,
+        compress_ratios=compress_ratios[:layers],
+        sliding_window=int(config.get("sliding_window") or 0),
     )
 
 
@@ -585,7 +602,10 @@ def generate_profile_bundles() -> list[Path]:
         with csv_path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow(("layer", "sequences", "time_us"))
-            for sequences in range(1, 129):
+            # Full-resident no-offload baselines can admit several hundred
+            # compressed-cache requests. Keep those local-batch rows inside
+            # LLMServingSim's interpolation domain instead of clamping at 128.
+            for sequences in range(1, 1153):
                 total_ms = analytical_decode_ms(spec.key, sequences)
                 writer.writerow(
                     (

@@ -13,8 +13,11 @@ from kvcache_offload_deploy_estimate.llmservingsim_shadowkv import (
     StorageName,
     _optimal_microbatch_size,
     _transfer_time_ms,
+    estimate_no_shadowkv_point,
     estimate_point,
     estimate_residency_scan,
+    native_cache_gib_per_gpu,
+    no_shadowkv_max_users,
     residency_scan,
     stage_layer_counts,
     stored_bytes_per_value,
@@ -260,3 +263,38 @@ def test_pp8_scheduler_uses_enough_groups_to_fill_pipeline() -> None:
         mtp_accepted_tokens=0,
     )
     assert microbatch <= math.ceil(scenario.max_users / scenario.pp_size)
+
+
+def test_no_shadowkv_admission_is_a_full_native_cache_hbm_limit() -> None:
+    scenario = next(item for item in SCENARIOS if item.id == "glm-256")
+    bf16_max = no_shadowkv_max_users(scenario, storage="bf16")
+    fp8_max = no_shadowkv_max_users(scenario, storage="fp8")
+    assert bf16_max == 14
+    assert fp8_max == 28
+    assert native_cache_gib_per_gpu(scenario, storage="bf16", users=bf16_max) <= 22.1
+    assert native_cache_gib_per_gpu(scenario, storage="bf16", users=bf16_max + 1) > 22.0
+
+
+def test_no_shadowkv_trace_has_no_host_transfer_or_landmark_selection() -> None:
+    scenario = next(item for item in SCENARIOS if item.id == "kimi-128")
+    point = estimate_no_shadowkv_point(
+        scenario,
+        users=4,
+        storage="fp8",
+        sensitivity_samples=0,
+    )
+    assert point.tpot_ms > 0
+    assert point.aggregate_tps == pytest.approx(point.users * point.per_user_tps)
+    assert {event.name for event in point.trace_events} == {"native_attention_hbm"}
+
+
+def test_no_shadowkv_rejects_requests_past_oom_boundary() -> None:
+    scenario = next(item for item in SCENARIOS if item.id == "flash-256")
+    maximum = no_shadowkv_max_users(scenario, storage="bf16")
+    with pytest.raises(ValueError, match="HBM admission ceiling"):
+        estimate_no_shadowkv_point(
+            scenario,
+            users=maximum + 1,
+            storage="bf16",
+            sensitivity_samples=0,
+        )

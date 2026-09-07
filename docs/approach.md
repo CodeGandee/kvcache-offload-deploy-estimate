@@ -7,7 +7,7 @@ This repository uses a reproducible three-part pipeline:
    decode/prefill roofline timings;
 3. generated timings are written in LLMServingSim's profile-bundle format and read
    through LLMServingSim's production interpolation path before external ShadowKV
-   events are added.
+   events or the no-ShadowKV native-attention roofline are added.
 
 It is still a simulation. No frontier-model weights were downloaded or executed.
 
@@ -92,7 +92,7 @@ included. No cross-node expert parallelism is modeled.
 
 ## LLMServingSim bridge
 
-The GenZ sweep covers 1–128 simultaneous sequences and is written to:
+The GenZ sweep covers 1–1,152 simultaneous sequences and is written to:
 
 ```text
 data/profiles/llmservingsim/A100-SXM4-80GB/<model>/official-dequant-bf16/
@@ -165,6 +165,50 @@ t_{\mathrm{H2D,stage}}=\max\!\left(
 \right).
 \]
 
+## No-ShadowKV native-cache control
+
+Case C removes landmarks, low-rank key reconstruction, sparse-selection overlays,
+host KV fetches, and whole-layer offload. It does not erase sparsity or compression
+that is native to a checkpoint. Kimi therefore scans dense MLA context; GLM and GLM
+Flash retain DSA; GLM Flash also retains 34 fixed-state KDA layers; and V4 Flash
+retains its 128-token windows and official 4×/128× compressed streams.
+
+For stage \(p\), native main-cache entries \(n_l(N)\), optional index-cache entries
+\(i_l(N)\), cached widths \(d_c,d_i\), storage bytes/value \(q\), and TP degree \(G_s\):
+
+\[
+K_{\mathrm{GPU}}(N,q)=
+\max_p\frac{q}{G_s}\sum_{l\in p}[n_l(N)d_c+i_l(N)d_i].
+\]
+
+The no-offload admission ceiling is memory-only:
+
+\[
+H_{\mathrm{GPU}}=0.90(80\ \mathrm{GiB})-W_{\mathrm{GPU}}-6\ \mathrm{GiB},
+\qquad
+C_{\max}=R\left\lfloor\frac{H_{\mathrm{GPU}}}{K_{\mathrm{GPU}}}\right\rfloor.
+\]
+
+The first request above \(C_{\max}\) is rejected; no host spill or hidden wait queue is
+modeled. The index allocation uses one 128-value key per indexed position shared
+across heads, matching the V4 Flash reference tensor. GLM uses the positions marked
+`full` in its official `indexer_types`; GLM Flash pools index positions by four.
+
+Native index scoring and main attention are sequential. Each receives a roofline over
+BF16 math, measured effective HBM bandwidth, and fused FP8 conversion:
+
+\[
+t_x=\max\!\left(
+\frac{F_x}{\eta_F\,F_{\max}},
+\frac{B_x}{\eta_B\,B_{\mathrm{HBM}}},
+\frac{V_x}{D_{\mathrm{FP8}}}
+\right),
+\qquad t_{\mathrm{attn},p}=t_{\mathrm{index},p}+t_{\mathrm{main},p}.
+\]
+
+This is an optimistic analytical native-attention bound, not a measured sparse-gather
+kernel. It assumes ideal cache sharding across each TP group.
+
 ## TPOT and throughput
 
 For a PP microbatch of \(b\) sequences, let \(s_p(b)\) be the generated core
@@ -188,6 +232,10 @@ The known-request scheduler searches
 \(1\le b\le\lceil C/P\rceil\). Larger microbatches would leave fewer than \(P\)
 groups, underfill the pipeline, and cannot improve a monotone stage service curve.
 PP=1 placements retain the complete continuous batch.
+
+For Case C, \(s_p(b)\) replaces the ShadowKV critical work with native index and
+attention roofline time. It has no H2D service constraint, and the search stops at the
+memory-only admission ceiling above.
 
 \[
 Y_{\mathrm{total}}=\frac{1000C}{T_{\mathrm{step}}},
@@ -225,8 +273,9 @@ profile at the enlarged batch:
 T_{\mathrm{core,verify}}(C,k)=T_{\mathrm{profile}}(kC).
 \]
 
-If the mean accepted prefix is \(A\), the round emits \(A+1\) tokens. The oracle
-applies only to the first position; later positions pay fetch-at-decode cache work.
+If the mean accepted prefix is \(A\), the round emits \(A+1\) tokens. In Cases A/B,
+the oracle applies only to the first position and later positions pay fetch-at-decode
+cache work. Case C instead verifies every position against the native HBM cache.
 
 Residency requests are rounded to implementable whole layers:
 
@@ -242,7 +291,8 @@ ratios and interpolates only between adjacent implementable points.
 
 The p10–p90 band is a deterministic parameter-sensitivity interval, not a confidence
 interval. It varies compute efficiency, measured GEMM MBU, HBM, PCIe, host DRAM,
-FP8/INT4 conversion, NVLink payload, selector timing, and materialization timing.
+FP8/INT4 conversion, NVLink payload, selector timing, and materialization timing. The
+no-ShadowKV interval varies the compute, HBM, conversion, and NVLink subset only.
 
 The central microbatch choice is held fixed across sensitivity samples. This avoids
 turning each uncertainty draw into a different scheduler and makes the band describe

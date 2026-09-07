@@ -11,6 +11,6 @@ the exact generator, CUDA kernel, Pixi manifest, and lock file sit beside it.
 
 Generated model-core tables live under
 `data/profiles/llmservingsim/A100-SXM4-80GB/`. Each target contains the GenZ inputs
-and source revisions in `meta.yaml` plus a 1–128-sequence `per_sequence.csv` in
+and source revisions in `meta.yaml` plus a 1–1,152-sequence `per_sequence.csv` in
 LLMServingSim's profile schema. Rebuild them with `pixi run profiles`; rebuilding the
 interactive report also refreshes them automatically.

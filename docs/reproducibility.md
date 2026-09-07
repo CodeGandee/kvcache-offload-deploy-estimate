@@ -53,19 +53,20 @@ pixi run report-assets
 ```
 
 The authoritative-oracle command is an optimistic upper bound. `report-assets`
-regenerates and embeds the base, 72K, MTP, and whole-layer residency datasets in the
-standalone report. The published
+regenerates and embeds the base, 72K, MTP, whole-layer residency, and no-ShadowKV
+native-cache datasets in the standalone report. The published
 central case deliberately omits `--trust-oracle`, so it still verifies the current
 token with landmarks.
 
 `pixi run profiles` reads the official tracked model configs, executes the GenZ
-roofline sweep for 1–128 sequences, and writes deterministic
+roofline sweep for 1–1,152 sequences, and writes deterministic
 `per_sequence.csv` bundles under `data/profiles/llmservingsim/`. Each bundle contains
 both total-core rows and PP-stage rows. The report build
 regenerates those profiles automatically. The estimator then reads the profiles
 through LLMServingSim's `_lookup_per_sequence`, imports its
-`_pp_stage_boundaries`, and emits external per-transformer-block ShadowKV events
-without modifying either upstream project.
+`_pp_stage_boundaries`, and emits either external per-transformer-block ShadowKV
+events or the native-cache attention roofline without modifying either upstream
+project.
 
 The Pixi dependency installs GenZ's Python dependency set, while the adapter prepends
 the pinned `extern/tracked/genz-llm-analyzer` checkout to `sys.path`. Consequently the
@@ -91,12 +92,11 @@ The gitlinks pin exact source/metadata commits. See `extern/tracked/README.md` a
 
 ## Report integrity
 
-`tests/integration/test_report.py` verifies that the standalone HTML contains both
-timing cases, the PP8×TP2 topology, 72K data, MTP cases, whole-layer residency controls,
-and central result markers. Unit tests verify pipeline fill, sparse working-set size,
-MTP acceptance accounting, whole-layer ratio rounding, resident-HBM payload removal,
-per-GPU layout invariance, the PP8 one-user latency floor across every GLM residency
-point, and TTFT formulas.
+`tests/integration/test_report.py` verifies that the standalone HTML contains all
+three serving cases, the PP8×TP2 topology, 72K data, MTP cases, whole-layer residency
+controls, and central result markers. Unit tests additionally verify the native-cache
+HBM ceiling, rejection immediately past that ceiling, and absence of host-transfer or
+landmark events in the no-ShadowKV trace.
 
 The report is standalone except for KaTeX assets loaded from jsDelivr. Its charts and
 case data are embedded directly in the HTML so the file can be opened locally.
@@ -109,8 +109,9 @@ The project therefore uses GenZ to generate the missing model-core tables from o
 config dimensions and stored precisions. The central hardware envelope combines the
 GenZ A100 compute-efficiency prior with the measured A100 HBM, BF16 GEMM MBU, fused
 dequantization, H2D, and P2P values. LLMServingSim consumes those generated tables and
-provides interpolation and PP partitioning; ShadowKV events are still an external
-adapter. For PP8, the estimator searches microbatch sizes that retain at least eight
+provides interpolation and PP partitioning; both ShadowKV events and the native
+attention/cache control are external adapters. For PP8, the estimator searches
+microbatch sizes that retain at least eight
 request groups and applies LLMServingSim's pipeline-depth recurrence; this is an
 analytical steady-state schedule rather than an ASTRA-Sim execution.
 

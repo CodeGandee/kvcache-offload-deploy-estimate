@@ -3,12 +3,15 @@
 from pathlib import Path
 
 
-def test_pp8_report_is_published_with_both_cases() -> None:
+def test_pp8_report_is_published_with_all_serving_cases() -> None:
     report = Path("docs/cases/a800-pp8-tp2-shadowkv.html")
     contents = report.read_text(encoding="utf-8")
     assert "PP8×TP2" in contents
     assert "fetch-at-decode" in contents
     assert "token-ahead" in contents
+    assert "no-shadowkv" in contents
+    assert "Case C · no ShadowKV" in contents
+    assert "the first request beyond" in contents
     assert "GLM-5.3-Flash" in contents
 
 
@@ -32,8 +35,9 @@ def test_report_includes_72k_mtp_and_whole_layer_residency() -> None:
     assert "Measured A100 hardware proxy" in report
     assert "25.4 GB/s aggregate" in report
     assert '"modelCoreFloorReplaced":true' in report
-    assert '"schemaVersion":4' in report
+    assert '"schemaVersion":5' in report
     assert '"microbatch":' in report
+    assert '"noShadow":' in report
 
 
 def test_all_static_and_dynamic_math_sections_are_rendered() -> None:

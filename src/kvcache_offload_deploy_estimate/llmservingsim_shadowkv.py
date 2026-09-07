@@ -28,6 +28,7 @@ from .genz_llmservingsim import (
     CENTRAL_HARDWARE,
     GENZ_COMMIT,
     LLMSERVINGSIM_COMMIT,
+    MODEL_SPECS,
     RooflineHardware,
     analytical_decode_ms,
     analytical_decode_stage_ms,
@@ -130,11 +131,7 @@ class Scenario:
 
     @property
     def load_users(self) -> tuple[int, int, int, int, int]:
-        def half_up(value: float) -> int:
-            return math.floor(value + 0.5)
-
-        loads = tuple(max(1, half_up(self.max_users * load)) for load in (0.25, 0.5, 0.75, 1.0))
-        return 1, loads[0], loads[1], loads[2], loads[3]
+        return load_users_for_max(self.max_users)
 
     def core_tpot_for_sequences(self, sequences: int, hardware: A800Host | None = None) -> float:
         """Return batch latency from the generated LLMServingSim profile."""
@@ -217,6 +214,28 @@ class ResidencyPoint:
     resident_gib_per_gpu: float
     hbm_feasible: bool
     estimate: PointEstimate
+
+
+@dataclass(frozen=True, slots=True)
+class NativeCacheLayer:
+    """Growing native-cache and attention work for one transformer layer."""
+
+    main_entries: int
+    attended_entries: int
+    index_entries: int = 0
+
+
+def load_users_for_max(max_users: int) -> tuple[int, int, int, int, int]:
+    """Return the report's single-user and 25/50/75/100% load points."""
+
+    if max_users < 1:
+        raise ValueError("admission ceiling must be positive")
+
+    def half_up(value: float) -> int:
+        return math.floor(value + 0.5)
+
+    loads = tuple(max(1, half_up(max_users * load)) for load in (0.25, 0.5, 0.75, 1.0))
+    return 1, loads[0], loads[1], loads[2], loads[3]
 
 
 def _tracked_llmservingsim_root() -> Path:
@@ -375,6 +394,191 @@ def resident_cache_gib_per_gpu(
         / scenario.tp_size
     )
     return max(resident_counts, default=0) * bytes_per_layer_gpu / 2**30
+
+
+@lru_cache(maxsize=128)
+def native_cache_layers(scenario: Scenario) -> tuple[NativeCacheLayer, ...]:
+    """Describe the official non-ShadowKV growing attention state.
+
+    Dense MLA retains every latent KV entry. GLM's DSA retains exact latent KV
+    for every attention layer and a shared 128-value index key only where its
+    official ``indexer_types`` entry is ``full``. GLM Flash applies the same
+    rule only to its 11 DSA layers and pools the index by four. DeepSeek V4
+    Flash follows its official per-layer compression ratios and 128-token
+    sliding window; ratio-4 layers also retain the source implementation's
+    shared 128-value index key.
+    """
+
+    spec = MODEL_SPECS[scenario.model_key]
+    context = scenario.context_tokens
+    if spec.compress_ratios:
+        layers = []
+        for ratio in spec.compress_ratios[: scenario.model_layers]:
+            compressed = math.ceil(context / ratio) if ratio else 0
+            window = min(context, spec.sliding_window)
+            main_entries = window + compressed
+            if ratio == 4:
+                attended = window + min(spec.index_topk, compressed)
+                index_entries = compressed
+            else:
+                attended = main_entries
+                index_entries = 0
+            layers.append(NativeCacheLayer(main_entries, attended, index_entries))
+        return tuple(layers)
+
+    layers = []
+    for index in range(scenario.model_layers):
+        is_linear = bool(spec.layer_types) and spec.layer_types[index] == "linear_attention"
+        if is_linear:
+            layers.append(NativeCacheLayer(0, 0, 0))
+            continue
+        attended = context if not spec.index_topk else min(context, spec.index_topk)
+        full_index = bool(spec.indexer_types) and spec.indexer_types[index] == "full"
+        index_entries = math.ceil(context / spec.index_pool) if full_index else 0
+        layers.append(NativeCacheLayer(context, attended, index_entries))
+    return tuple(layers)
+
+
+def _native_stage_layers(scenario: Scenario) -> tuple[tuple[NativeCacheLayer, ...], ...]:
+    layers = native_cache_layers(scenario)
+    counts = stage_layer_counts(scenario.model_layers, scenario.pp_size)
+    stages = []
+    start = 0
+    for count in counts:
+        stages.append(layers[start : start + count])
+        start += count
+    return tuple(stages)
+
+
+def native_cache_gib_per_gpu(
+    scenario: Scenario,
+    *,
+    storage: StorageName,
+    users: int,
+) -> float:
+    """Maximum native full-cache allocation on one GPU across all PP stages."""
+
+    if users < 1:
+        raise ValueError("users must be positive")
+    spec = MODEL_SPECS[scenario.model_key]
+    local_users = math.ceil(users / scenario.replicas)
+    stage_values = [
+        sum(
+            layer.main_entries * scenario.cached_width + layer.index_entries * spec.index_dim
+            for layer in stage
+        )
+        for stage in _native_stage_layers(scenario)
+    ]
+    per_gpu_values = max(stage_values, default=0.0) * local_users / scenario.tp_size
+    return per_gpu_values * stored_bytes_per_value(storage) / 2**30
+
+
+def native_hbm_headroom_gib(
+    scenario: Scenario,
+    *,
+    hbm_utilization: float = 0.90,
+    runtime_reserve_gib: float = 6.0,
+) -> float:
+    """Planning HBM left after official-format weights and runtime reserve."""
+
+    if not 0.0 < hbm_utilization <= 1.0 or runtime_reserve_gib < 0.0:
+        raise ValueError("invalid HBM utilization or runtime reserve")
+    weight_per_gpu_gib = scenario.weight_per_gpu_gb * 1e9 / 2**30
+    return max(0.0, 80.0 * hbm_utilization - weight_per_gpu_gib - runtime_reserve_gib)
+
+
+def no_shadowkv_max_users(
+    scenario: Scenario,
+    *,
+    storage: StorageName,
+    hbm_utilization: float = 0.90,
+    runtime_reserve_gib: float = 6.0,
+) -> int:
+    """Memory-only admission ceiling for the full native cache in HBM."""
+
+    per_replica_user = native_cache_gib_per_gpu(scenario, storage=storage, users=1)
+    if per_replica_user <= 0.0:
+        raise ValueError("native growing cache must consume positive HBM")
+    per_replica = math.floor(
+        native_hbm_headroom_gib(
+            scenario,
+            hbm_utilization=hbm_utilization,
+            runtime_reserve_gib=runtime_reserve_gib,
+        )
+        / per_replica_user
+    )
+    return max(0, per_replica * scenario.replicas)
+
+
+def _native_attention_stage_ms(
+    scenario: Scenario,
+    *,
+    sequences: int,
+    storage: StorageName,
+    hardware: A800Host,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Return native attention roofline time and cache bytes read per PP stage.
+
+    Index scoring and exact/native-cache attention are causally sequential and
+    therefore summed. Within each kernel, BF16 compute, HBM traffic, and fused
+    FP8 conversion share a max roofline. The HBM denominator uses the measured
+    representative kernel MBU rather than peak spec bandwidth.
+    """
+
+    if sequences < 1:
+        raise ValueError("sequences must be positive")
+    spec = MODEL_SPECS[scenario.model_key]
+    bytes_per_value = stored_bytes_per_value(storage)
+    effective_hbm_gbps = hardware.decode_gemm_mbu * 2039.0
+    effective_compute_tflops = hardware.peak_bf16_tflops * hardware.bf16_compute_efficiency
+    stage_times = []
+    stage_bytes = []
+    for stage in _native_stage_layers(scenario):
+        main_values = (
+            sequences
+            * sum(layer.attended_entries * scenario.cached_width for layer in stage)
+            / scenario.tp_size
+        )
+        main_flops = (
+            2.0
+            * sequences
+            * sum(
+                layer.attended_entries * spec.attention_heads * (spec.qk_head_dim + spec.v_head_dim)
+                for layer in stage
+            )
+            / scenario.tp_size
+        )
+        main_bytes = main_values * bytes_per_value
+        main_ms = max(
+            main_flops / (effective_compute_tflops * 1e12) * 1000.0,
+            main_bytes / (effective_hbm_gbps * 1e9) * 1000.0,
+            (main_values / (hardware.fp8_dequant_gbps * 1e9) * 1000.0 if storage == "fp8" else 0.0),
+        )
+
+        index_values = (
+            sequences
+            * sum(layer.index_entries * spec.index_dim for layer in stage)
+            / scenario.tp_size
+        )
+        index_flops = (
+            2.0
+            * sequences
+            * sum(layer.index_entries * spec.index_heads * spec.index_dim for layer in stage)
+            / scenario.tp_size
+        )
+        index_bytes = index_values * bytes_per_value
+        index_ms = max(
+            index_flops / (effective_compute_tflops * 1e12) * 1000.0,
+            index_bytes / (effective_hbm_gbps * 1e9) * 1000.0,
+            (
+                index_values / (hardware.fp8_dequant_gbps * 1e9) * 1000.0
+                if storage == "fp8"
+                else 0.0
+            ),
+        )
+        stage_times.append(main_ms + index_ms)
+        stage_bytes.append(main_bytes + index_bytes)
+    return tuple(stage_times), tuple(stage_bytes)
 
 
 def _resident_materialize_ms_per_block(
@@ -819,6 +1023,204 @@ def estimate_point(
     )
 
 
+def _estimate_no_shadowkv_once(
+    scenario: Scenario,
+    *,
+    users: int,
+    storage: StorageName,
+    hardware: A800Host,
+    mtp_accepted_tokens: int = 0,
+    microbatch_override: int | None = None,
+) -> tuple[float, tuple[TraceEvent, ...]]:
+    """Estimate full native-cache serving with no ShadowKV or host offload."""
+
+    maximum = no_shadowkv_max_users(scenario, storage=storage)
+    if not 1 <= users <= maximum:
+        raise ValueError("users must fit the no-ShadowKV HBM admission ceiling")
+    if mtp_accepted_tokens < 0:
+        raise ValueError("mtp_accepted_tokens cannot be negative")
+    if mtp_accepted_tokens and scenario.mtp_draft_tokens == 0:
+        raise ValueError(f"{scenario.model} has no checkpoint MTP component")
+    if mtp_accepted_tokens > scenario.mtp_draft_tokens:
+        raise ValueError("accepted MTP tokens cannot exceed the configured draft length")
+
+    verification_tokens = scenario.mtp_draft_tokens if mtp_accepted_tokens else 1
+    emitted_tokens = mtp_accepted_tokens + 1 if mtp_accepted_tokens else 1
+    local_users = math.ceil(users / scenario.replicas)
+    if microbatch_override is None:
+        microbatch_override = _optimal_no_shadowkv_microbatch_size(
+            scenario,
+            users=users,
+            storage=storage,
+            mtp_accepted_tokens=mtp_accepted_tokens,
+        )
+    if not 1 <= microbatch_override <= local_users:
+        raise ValueError("microbatch size must be within users per replica")
+    batch_users = microbatch_override
+    pipeline_groups = math.ceil(local_users / batch_users)
+    verified_sequences = batch_users * verification_tokens
+    core_stages = scenario.core_stage_tpot_for_sequences(verified_sequences, hardware)
+    attention_stages, cache_bytes = _native_attention_stage_ms(
+        scenario,
+        sequences=verified_sequences,
+        storage=storage,
+        hardware=hardware,
+    )
+
+    stage_communications = [0.0] * scenario.pp_size
+    if scenario.pp_size > 1:
+        for stage in range(scenario.pp_size - 1):
+            source_node = min(scenario.nodes - 1, stage * scenario.nodes // scenario.pp_size)
+            target_node = min(scenario.nodes - 1, (stage + 1) * scenario.nodes // scenario.pp_size)
+            stage_communications[stage] = (
+                hardware.ib_latency_ms if source_node != target_node else hardware.nvlink_latency_ms
+            )
+
+    events = [
+        TraceEvent(
+            stage=stage,
+            node=min(scenario.nodes - 1, stage * scenario.nodes // scenario.pp_size),
+            name="native_attention_hbm",
+            critical_ms=attention_ms,
+            bytes_moved=bytes_read,
+        )
+        for stage, (attention_ms, bytes_read) in enumerate(
+            zip(attention_stages, cache_bytes, strict=True)
+        )
+    ]
+
+    mtp_draft = 0.0
+    if verification_tokens > 1:
+        one_core = scenario.core_tpot_for_sequences(batch_users, hardware)
+        one_attention, _ = _native_attention_stage_ms(
+            scenario,
+            sequences=batch_users,
+            storage=storage,
+            hardware=hardware,
+        )
+        mtp_draft = verification_tokens * (
+            one_core / scenario.model_layers + sum(one_attention) / scenario.model_layers
+        )
+        events.append(
+            TraceEvent(
+                stage=scenario.pp_size - 1,
+                node=scenario.nodes - 1,
+                name="mtp_autoregressive_draft",
+                critical_ms=mtp_draft,
+            )
+        )
+
+    stage_services = [
+        core + attention + communication
+        for core, attention, communication in zip(
+            core_stages, attention_stages, stage_communications, strict=True
+        )
+    ]
+    stage_services[-1] += mtp_draft
+    recurrence = max(scenario.pp_size, pipeline_groups) * max(stage_services)
+    return recurrence / emitted_tokens, tuple(events)
+
+
+@lru_cache(maxsize=4096)
+def _optimal_no_shadowkv_microbatch_size(
+    scenario: Scenario,
+    *,
+    users: int,
+    storage: StorageName,
+    mtp_accepted_tokens: int,
+) -> int:
+    """Choose the throughput-optimal PP microbatch for native-cache serving."""
+
+    local_users = math.ceil(users / scenario.replicas)
+    if scenario.pp_size == 1:
+        return local_users
+    maximum = math.ceil(local_users / scenario.pp_size)
+    return min(
+        range(1, maximum + 1),
+        key=lambda microbatch: _estimate_no_shadowkv_once(
+            scenario,
+            users=users,
+            storage=storage,
+            hardware=DEFAULT_HARDWARE,
+            mtp_accepted_tokens=mtp_accepted_tokens,
+            microbatch_override=microbatch,
+        )[0],
+    )
+
+
+def estimate_no_shadowkv_point(
+    scenario: Scenario,
+    *,
+    users: int,
+    storage: StorageName,
+    hardware: A800Host = DEFAULT_HARDWARE,
+    sensitivity_samples: int = 256,
+    seed: int = 17,
+    mtp_accepted_tokens: int = 0,
+) -> PointEstimate:
+    """Estimate a no-offload native-cache point within its HBM admission cap."""
+
+    microbatch = _optimal_no_shadowkv_microbatch_size(
+        scenario,
+        users=users,
+        storage=storage,
+        mtp_accepted_tokens=mtp_accepted_tokens,
+    )
+    central, events = _estimate_no_shadowkv_once(
+        scenario,
+        users=users,
+        storage=storage,
+        hardware=hardware,
+        mtp_accepted_tokens=mtp_accepted_tokens,
+        microbatch_override=microbatch,
+    )
+    rng = random.Random(f"{seed}:{scenario.id}:no-shadowkv:{users}:{storage}")
+    samples = []
+    for _ in range(max(0, sensitivity_samples)):
+        sample_hardware = A800Host(
+            hbm_stream_gbps=rng.triangular(1700.0, 1810.0, hardware.hbm_stream_gbps),
+            decode_gemm_mbu=rng.triangular(0.307, 0.618, hardware.decode_gemm_mbu),
+            peak_bf16_tflops=hardware.peak_bf16_tflops,
+            bf16_compute_efficiency=rng.triangular(0.30, 0.55, hardware.bf16_compute_efficiency),
+            pcie_per_gpu_gbps=hardware.pcie_per_gpu_gbps,
+            pcie_tp2_pair_gbps=hardware.pcie_tp2_pair_gbps,
+            host_dram_gbps=hardware.host_dram_gbps,
+            fp8_dequant_gbps=rng.triangular(320.0, 520.0, hardware.fp8_dequant_gbps),
+            int4_dequant_gbps=rng.triangular(280.0, 520.0, hardware.int4_dequant_gbps),
+            nvlink_latency_ms=hardware.nvlink_latency_ms,
+            nvlink_payload_gbps=rng.triangular(240.0, 300.0, hardware.nvlink_payload_gbps),
+            ib_latency_ms=hardware.ib_latency_ms,
+            ib_payload_gbps=hardware.ib_payload_gbps,
+        )
+        sample, _ = _estimate_no_shadowkv_once(
+            scenario,
+            users=users,
+            storage=storage,
+            hardware=sample_hardware,
+            mtp_accepted_tokens=mtp_accepted_tokens,
+            microbatch_override=microbatch,
+        )
+        samples.append(sample)
+    samples.sort()
+
+    def percentile(fraction: float) -> float:
+        if not samples:
+            return central
+        return samples[min(len(samples) - 1, round((len(samples) - 1) * fraction))]
+
+    return PointEstimate(
+        users=users,
+        users_per_replica=math.ceil(users / scenario.replicas),
+        selected_microbatch=microbatch,
+        tpot_ms=central,
+        aggregate_tps=1000.0 * users / central,
+        per_user_tps=1000.0 / central,
+        sensitivity_p10_ms=percentile(0.10),
+        sensitivity_p90_ms=percentile(0.90),
+        trace_events=events,
+    )
+
+
 def estimate_residency_scan(
     scenario: Scenario,
     *,
@@ -1030,6 +1432,29 @@ def build_report(
                     for index in range(5)
                 ]
                 storage_results[policy] = [asdict(point) for point in points]
+            native_max = no_shadowkv_max_users(scenario, storage=storage)
+            if native_max < 1:
+                raise RuntimeError(f"{scenario.id} cannot admit one native-cache request")
+            native_users = load_users_for_max(native_max)
+            storage_results["no-shadowkv"] = {
+                "max_users": native_max,
+                "load_users": native_users,
+                "native_cache_gib_per_gpu_per_user": native_cache_gib_per_gpu(
+                    scenario, storage=storage, users=1
+                ),
+                "hbm_headroom_gib": native_hbm_headroom_gib(scenario),
+                "points": [
+                    asdict(
+                        estimate_no_shadowkv_point(
+                            scenario,
+                            users=users,
+                            storage=storage,
+                            sensitivity_samples=sensitivity_samples,
+                        )
+                    )
+                    for users in native_users
+                ],
+            }
             cast(dict[str, Any], item["results"])[storage] = storage_results
         series.append(item)
     return {
@@ -1108,6 +1533,7 @@ def build_interactive_dataset(*, sensitivity_samples: int = 256) -> dict[str, An
             "base": {},
             "mtp": {},
             "residency": {},
+            "admission": {},
         }
         for storage in ("bf16", "fp8"):
             base_storage: dict[str, Any] = {}
@@ -1174,12 +1600,57 @@ def build_interactive_dataset(*, sensitivity_samples: int = 256) -> dict[str, An
                         }
                     )
                 residency_storage[short_policy] = residency_curves
+            native_max = no_shadowkv_max_users(scenario, storage=storage)
+            if native_max < 1:
+                raise RuntimeError(f"{scenario.id} cannot admit one native-cache request")
+            native_users = load_users_for_max(native_max)
+            base_storage["noShadow"] = [
+                _compact_point(
+                    estimate_no_shadowkv_point(
+                        scenario,
+                        users=users,
+                        storage=storage,
+                        sensitivity_samples=sensitivity_samples,
+                    )
+                )
+                for users in native_users
+            ]
+            if scenario.mtp_draft_tokens:
+                mtp_storage["noShadow"] = {
+                    str(accepted): [
+                        _compact_point(
+                            estimate_no_shadowkv_point(
+                                scenario,
+                                users=users,
+                                storage=storage,
+                                sensitivity_samples=0,
+                                mtp_accepted_tokens=accepted,
+                            )
+                        )
+                        for users in native_users
+                    ]
+                    for accepted in (1, 2)
+                }
+            single_prefill = analytical_prefill_seconds(scenario.model_key, scenario.context_tokens)
+            native_ttft, native_last = _burst_ttft(single_prefill, native_max, scenario.replicas)
+            cast(dict[str, Any], item["admission"])[storage] = {
+                "noShadow": {
+                    "max": native_max,
+                    "users": native_users,
+                    "ttft": native_ttft,
+                    "last": native_last,
+                    "cacheGiBPerGpuPerUser": round(
+                        native_cache_gib_per_gpu(scenario, storage=storage, users=1), 6
+                    ),
+                    "hbmHeadroomGiB": round(native_hbm_headroom_gib(scenario), 6),
+                }
+            }
             cast(dict[str, Any], item["base"])[storage] = base_storage
             cast(dict[str, Any], item["mtp"])[storage] = mtp_storage
             cast(dict[str, Any], item["residency"])[storage] = residency_storage
         series.append(item)
     return {
-        "schemaVersion": 4,
+        "schemaVersion": 5,
         "loads": [0, 25, 50, 75, 100],
         "residencyLoads": list(residency_loads),
         "residencyRequested": list(range(0, 101, 10)),
@@ -1190,6 +1661,9 @@ def build_interactive_dataset(*, sensitivity_samples: int = 256) -> dict[str, An
             "hbmUtilization": 0.90,
             "runtimeReserveGiB": 6.0,
             "residentLayersAreBalancedAcrossStages": True,
+            "noShadowKVAdmissionIsMemoryOnly": True,
+            "noShadowKVRejectsBeyondAdmission": True,
+            "noShadowKVNativeIndexCacheIsSharedAcrossHeads": True,
             "hardwareCalibration": {
                 "source": "synthetic A100-SXM4-80GB GPUs 2+3, used as an A800 proxy",
                 "artifact": "benchmarks/a100-sxm4/results/a100-sxm4-80gb-gpu2-3.json",
