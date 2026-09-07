@@ -1,0 +1,1301 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ShadowKV PP8×TP2 Two-Case Capacity Estimate — A800 Cluster</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/katex.min.css" integrity="sha384-1vdNCNel6Tx/NQa8IR1mGOGKsbGreCkOPfbtPPnUURJ5Tu2PRVfQ/7KLZC+Pi1p1" crossorigin="anonymous">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/katex.min.js" integrity="sha384-ycJ6GAwiS15LoUPipwJOrWTvkUHl/YqELValBwI5I4awP1EeEQJYarj+w85ntcz7" crossorigin="anonymous"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.18.1/dist/contrib/auto-render.min.js" integrity="sha384-bjyGPfbij8/NDKJhSGZNP/khQVgtHUE5exjm4Ydllo42FwIgYsdLO2lXGmRBf5Mz" crossorigin="anonymous"></script>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f5f7fb;
+      --surface: #ffffff;
+      --surface-2: #eef2f7;
+      --text: #172033;
+      --muted: #617087;
+      --border: #d7deea;
+      --grid: #e5eaf1;
+      --accent: #2864dc;
+      --accent-soft: #e7efff;
+      --good: #16845b;
+      --warn: #a76106;
+      --bad: #b63b4a;
+      --s1: #2673df;
+      --s2: #25a5b5;
+      --s3: #16845b;
+      --s4: #78a72f;
+      --s5: #7956d8;
+      --s6: #ce4f82;
+      --shadow: 0 14px 35px rgba(27, 44, 73, 0.08);
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0d1119;
+        --surface: #151b26;
+        --surface-2: #202938;
+        --text: #edf2fb;
+        --muted: #a9b5c8;
+        --border: #303b4f;
+        --grid: #273245;
+        --accent: #82aaff;
+        --accent-soft: #1c2b4a;
+        --good: #65d7a6;
+        --warn: #f3ba62;
+        --bad: #ff8492;
+        --s1: #6ba6ff;
+        --s2: #55cad7;
+        --s3: #65d7a6;
+        --s4: #b3d66e;
+        --s5: #a98cff;
+        --s6: #f07bac;
+        --shadow: 0 16px 38px rgba(0, 0, 0, 0.25);
+      }
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+    }
+    a { color: var(--accent); }
+    button, input { font: inherit; }
+    button:focus-visible, input:focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 38%, transparent); outline-offset: 2px; }
+    .page { width: min(1180px, calc(100% - 32px)); margin: 0 auto; }
+    [hidden] { display: none !important; }
+    .case-nav-shell { position: sticky; top: 0; z-index: 50; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(14px); }
+    .case-nav { width: min(1180px, calc(100% - 32px)); margin: 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 10px 0; }
+    .case-nav-label { color: var(--muted); font-size: 0.8rem; font-weight: 750; letter-spacing: 0.04em; text-transform: uppercase; }
+    .nav-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+    .nav-choice { display: flex; align-items: center; gap: 7px; }
+    .nav-choice-label { color: var(--muted); font-size: 0.72rem; font-weight: 700; }
+    .case-switch { display: inline-flex; padding: 3px; border-radius: 11px; background: var(--surface-2); }
+    .case-switch button { border: 0; border-radius: 8px; padding: 8px 14px; background: transparent; color: var(--muted); cursor: pointer; }
+    .case-switch button[aria-pressed="true"] { background: var(--surface); color: var(--text); box-shadow: 0 1px 6px rgba(0,0,0,0.14); }
+    .hero { padding: 64px 0 36px; }
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--accent);
+      font-size: 0.78rem;
+      font-weight: 750;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+    h1 { margin: 0; max-width: 940px; font-size: clamp(2.1rem, 5vw, 4.6rem); line-height: 1.02; letter-spacing: -0.055em; }
+    .hero-copy { max-width: 850px; margin: 22px 0 0; color: var(--muted); font-size: clamp(1rem, 2vw, 1.18rem); }
+    .scope-line { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 24px; }
+    .chip { padding: 7px 11px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--muted); font-size: 0.84rem; }
+    .status-chip { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 38%, var(--border)); background: color-mix(in srgb, var(--warn) 8%, var(--surface)); }
+    main { padding-bottom: 72px; }
+    section { margin-top: 42px; }
+    .section-head { display: flex; align-items: end; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
+    h2 { margin: 0; font-size: clamp(1.35rem, 2.4vw, 2rem); letter-spacing: -0.025em; }
+    h3 { margin: 0; font-size: 1rem; }
+    .section-note { max-width: 660px; margin: 0; color: var(--muted); font-size: 0.92rem; }
+    .summary-grid, .assumption-grid, .model-grid { display: grid; gap: 14px; }
+    .summary-grid { grid-template-columns: repeat(3, 1fr); }
+    .assumption-grid { grid-template-columns: repeat(2, 1fr); }
+    .model-grid { grid-template-columns: repeat(3, 1fr); }
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      padding: 20px;
+    }
+    .summary-card strong { display: block; margin-top: 7px; font-size: 1.3rem; line-height: 1.25; }
+    .summary-card p, .model-card p { margin: 8px 0 0; color: var(--muted); font-size: 0.92rem; }
+    .kicker { color: var(--accent); font-size: 0.76rem; font-weight: 750; letter-spacing: 0.08em; text-transform: uppercase; }
+    .assumption-card ul, .limits-list { margin: 12px 0 0; padding-left: 20px; }
+    li + li { margin-top: 8px; }
+    .model-card .maxima { margin-top: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .model-card .maxima div { padding: 10px; border-radius: 10px; background: var(--surface-2); }
+    .model-card .maxima span { display: block; color: var(--muted); font-size: 0.77rem; }
+    .model-card .maxima strong { display: block; margin-top: 2px; font-size: 1.05rem; }
+    .callout { margin-top: 14px; border-left: 4px solid var(--warn); background: color-mix(in srgb, var(--warn) 8%, var(--surface)); padding: 14px 16px; border-radius: 4px 12px 12px 4px; }
+    .callout strong { color: var(--warn); }
+    .interactive-shell { border: 1px solid var(--border); border-radius: 20px; background: var(--surface); box-shadow: var(--shadow); padding: 22px; }
+    .controls { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: end; gap: 18px; margin-bottom: 16px; }
+    .control-group { min-width: 250px; }
+    .control-label { display: flex; justify-content: space-between; gap: 14px; margin-bottom: 8px; color: var(--muted); font-size: 0.82rem; font-weight: 700; }
+    .segmented { display: inline-flex; padding: 3px; border-radius: 11px; background: var(--surface-2); }
+    .segmented button { border: 0; border-radius: 8px; padding: 7px 13px; background: transparent; color: var(--muted); cursor: pointer; }
+    .segmented button[aria-pressed="true"] { background: var(--surface); color: var(--text); box-shadow: 0 1px 5px rgba(0,0,0,0.12); }
+    .range-wrap { width: min(440px, 100%); }
+    input[type="range"] { width: 100%; accent-color: var(--accent); cursor: pointer; }
+    .range-ticks { display: flex; justify-content: space-between; color: var(--muted); font-size: 0.74rem; }
+    .legend { display: flex; flex-wrap: wrap; gap: 7px 16px; padding: 14px 0 6px; border-top: 1px solid var(--border); }
+    .legend button { display: inline-flex; align-items: center; gap: 7px; min-height: 32px; padding: 0; border: 0; background: transparent; color: var(--text); cursor: pointer; font-size: 0.83rem; }
+    .legend button[aria-pressed="false"] { opacity: 0.34; }
+    .legend button.context-muted { opacity: 0.25; }
+    .swatch { width: 18px; height: 3px; border-radius: 2px; flex: 0 0 auto; }
+    .chart-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+    .chart-card { position: relative; border: 1px solid var(--border); border-radius: 14px; padding: 14px 12px 10px; min-width: 0; background: var(--surface); }
+    .chart-title { padding: 0 4px; }
+    .chart-subtitle { margin: 3px 4px 0; color: var(--muted); font-size: 0.78rem; }
+    .chart { width: 100%; min-height: 280px; }
+    .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+    .chart .frame, .chart .axis-line { stroke: var(--border); fill: none; }
+    .chart .grid-line { stroke: var(--grid); stroke-width: 1; }
+    .chart .axis-text, .chart .axis-title, .chart .threshold-label { fill: var(--muted); font-size: 11px; }
+    .chart .series-line { fill: none; stroke-width: 2.2; }
+    .chart .series-dot { stroke: var(--surface); stroke-width: 1.5; }
+    .chart .selected-guide { stroke: var(--text); stroke-width: 1; stroke-dasharray: 3 4; opacity: 0.55; }
+    .chart .hover-guide { stroke: var(--muted); stroke-width: 1; pointer-events: none; }
+    .chart .hover-marker { stroke: var(--surface); stroke-width: 1.5; pointer-events: none; }
+    .chart .hit { fill: transparent; cursor: crosshair; }
+    .tooltip { position: absolute; z-index: 20; pointer-events: none; max-width: min(330px, calc(100% - 20px)); border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); color: var(--text); box-shadow: var(--shadow); padding: 9px 11px; font-size: 0.78rem; }
+    .tooltip[hidden] { display: none; }
+    .tooltip-title { font-weight: 750; margin-bottom: 5px; }
+    .tooltip-row { display: grid; grid-template-columns: 10px minmax(90px, 1fr) auto; align-items: center; gap: 7px; }
+    .tooltip-row + .tooltip-row { margin-top: 3px; }
+    .tooltip-value { font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .scenario { margin-top: 18px; }
+    .scenario h3 { margin-bottom: 10px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 820px; font-size: 0.84rem; }
+    th, td { padding: 10px 11px; border-bottom: 1px solid var(--border); text-align: right; vertical-align: top; font-variant-numeric: tabular-nums; }
+    th { color: var(--muted); font-size: 0.75rem; letter-spacing: 0.02em; }
+    th:first-child, td:first-child { text-align: left; font-variant-numeric: normal; }
+    tbody tr:last-child td { border-bottom: 0; }
+    .series-name { display: inline-flex; align-items: center; gap: 7px; font-weight: 700; }
+    .method-grid { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 14px; }
+    .formula { display: block; margin: 10px 0; padding: 12px 14px; border-radius: 10px; background: var(--surface-2); font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.84rem; overflow-x: auto; }
+    .definition-list { display: grid; grid-template-columns: max-content 1fr; gap: 8px 14px; margin: 12px 0 0; }
+    .definition-list dt { font-weight: 750; }
+    .definition-list dd { margin: 0; color: var(--muted); }
+    .guidance-table td:nth-child(3) { color: var(--muted); }
+    .math-details { border: 1px solid var(--border); border-radius: 16px; background: var(--surface); box-shadow: var(--shadow); overflow: clip; }
+    .math-details > summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px; cursor: pointer; font-weight: 750; list-style: none; }
+    .math-details > summary::-webkit-details-marker { display: none; }
+    .math-details > summary::after { content: "+"; display: grid; place-items: center; width: 28px; height: 28px; flex: 0 0 auto; border-radius: 50%; background: var(--surface-2); color: var(--accent); font-size: 1.15rem; }
+    .math-details[open] > summary::after { content: "−"; }
+    .summary-copy { display: block; }
+    .summary-copy small { display: block; margin-top: 3px; color: var(--muted); font-weight: 450; }
+    .math-body { padding: 0 20px 22px; border-top: 1px solid var(--border); }
+    .math-body h3 { margin-top: 24px; }
+    .math-body p { color: var(--muted); }
+    .math-body .katex-display { overflow-x: auto; overflow-y: hidden; padding: 5px 0; }
+    .math-step { margin-top: 16px; padding: 16px; border-radius: 12px; background: var(--surface-2); }
+    .math-step p:last-child { margin-bottom: 0; }
+    .math-table { min-width: 760px; }
+    .math-table td:first-child { font-weight: 700; }
+    .math-note { border-left: 3px solid var(--accent); padding-left: 13px; }
+    .footnote { margin-top: 30px; padding-top: 18px; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.8rem; }
+    .good { color: var(--good); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    @media (max-width: 880px) {
+      .summary-grid, .model-grid { grid-template-columns: 1fr; }
+      .assumption-grid, .chart-grid, .method-grid { grid-template-columns: 1fr; }
+      .section-head { display: block; }
+      .section-note { margin-top: 8px; }
+    }
+    @media (max-width: 520px) {
+      .page { width: min(100% - 20px, 1180px); }
+      .hero { padding-top: 38px; }
+      .card, .interactive-shell { padding: 16px; border-radius: 14px; }
+      .controls { display: block; }
+      .control-group, .range-wrap { width: 100%; min-width: 0; }
+      .range-wrap { margin-top: 16px; }
+      .segmented { width: 100%; }
+      .segmented button { flex: 1; }
+      .legend { display: grid; grid-template-columns: 1fr 1fr; }
+      .legend button { min-height: 44px; text-align: left; }
+      .chart-card { padding-inline: 6px; }
+      .math-details > summary, .math-body { padding-left: 16px; padding-right: 16px; }
+      .case-nav { width: min(100% - 20px, 1180px); display: block; }
+      .case-nav-label { display: block; margin-bottom: 7px; }
+      .nav-controls { display: grid; grid-template-columns: 1fr; justify-content: stretch; }
+      .nav-choice { display: grid; grid-template-columns: 62px 1fr; }
+      .case-switch { width: 100%; }
+      .case-switch button { flex: 1; padding-inline: 8px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="case-nav-shell">
+    <nav class="case-nav" aria-label="ShadowKV timing case">
+      <span class="case-nav-label">Choose report page</span>
+      <div class="nav-controls">
+        <div class="nav-choice">
+          <span class="nav-choice-label">Timing</span>
+          <div class="case-switch" role="group" aria-label="Timing case">
+            <button type="button" data-case="ahead" aria-pressed="true">Case A · token-ahead</button>
+            <button type="button" data-case="fetch" aria-pressed="false">Case B · fetch at decode</button>
+          </div>
+        </div>
+        <div class="nav-choice">
+          <span class="nav-choice-label">KV format</span>
+          <div class="case-switch" role="group" aria-label="KV-cache storage format">
+            <button type="button" data-storage="bf16" aria-pressed="true">BF16</button>
+            <button type="button" data-storage="fp8" aria-pressed="false">FP8 → BF16 compute</button>
+          </div>
+        </div>
+      </div>
+    </nav>
+  </div>
+  <header class="hero page">
+    <p class="eyebrow" id="case-eyebrow">Case A · optimistic token-ahead prefetch</p>
+    <h1 id="case-title">ShadowKV with one-token-ahead prediction</h1>
+    <p class="hero-copy" id="case-hero-copy">An ideal-case estimate of raw TTFT, TPOT, output throughput, and simultaneous-user capacity when official Hugging Face weight formats are dequantized for BF16 compute. Kimi and GLM span two IB-connected 8×A800 nodes; V4 Flash uses one node.</p>
+    <div class="scope-line" aria-label="Study scope">
+      <span class="chip">1–2 nodes · 8×A800 80 GB each</span>
+      <span class="chip">Kimi/GLM · PP8×TP2</span>
+      <span class="chip">128K / 256K input</span>
+      <span class="chip">Official HF weights → BF16 compute</span>
+      <span class="chip">1.56% KV selection</span>
+      <span class="chip" id="kv-format-chip">BF16 exact-KV storage</span>
+      <span class="chip" id="case-mode-chip">80% token-ahead prefetch hit</span>
+      <span class="chip" id="case-reuse-chip" hidden>60% temporal-cache reuse</span>
+      <span class="chip status-chip" id="case-status-chip">Modeled, not benchmarked</span>
+    </div>
+  </header>
+
+  <main class="page">
+    <section aria-labelledby="weight-placement-title">
+      <div class="section-head">
+        <h2 id="weight-placement-title">Official-weight placement</h2>
+        <p class="section-note">Safetensor totals come from the official Hugging Face repositories. Stored weights are unpacked or converted inside fused kernels; BF16 activations and BF16 tensor-core compute are assumed, without retaining a full BF16 copy.</p>
+      </div>
+      <div class="summary-grid">
+        <article class="card summary-card">
+          <span class="kicker">Kimi Code 2.7</span>
+          <strong>595.2 GB INT4 · two nodes</strong>
+          <p>The files technically occupy 93% of one node's nominal HBM, leaving too little runtime workspace. The estimate therefore uses eight contiguous TP2 stages—roughly 7–8 layers each—with four stages on each server.</p>
+        </article>
+        <article class="card summary-card">
+          <span class="kicker">GLM-5.3</span>
+          <strong>755.6 GB FP8 · two nodes</strong>
+          <p>The official checkpoint cannot fit in 640 GB. Eight contiguous TP2 stages—roughly 9–10 layers each—avoid expert all-to-all across IB; FP8 weights are converted to BF16 fragments as consumed.</p>
+        </article>
+        <article class="card summary-card">
+          <span class="kicker">DeepSeek V4 Flash</span>
+          <strong>159.6 GB FP4/FP8 · one node</strong>
+          <p>Two independent four-GPU replicas remain feasible. Mixed-format weights are converted in the matmul path and never expanded into a persistent BF16 model image.</p>
+        </article>
+      </div>
+      <div class="callout"><strong>Topology assumption:</strong> Kimi and GLM use PP8×TP2. Stages 1–4 are contiguous on server A and stages 5–8 on server B, so only the stage-4→5 BF16 activation crosses 400 Gb/s IB, modeled as 40 GB/s usable. The other six stage boundaries stay on NVLink. Cross-node expert parallelism is excluded.</div>
+    </section>
+
+    <section id="fp8-summary" aria-labelledby="fp8-summary-title" hidden>
+      <div class="section-head">
+        <h2 id="fp8-summary-title">FP8 KV-storage overlay</h2>
+        <p class="section-note">Exact/offloaded KV and the selected GPU working set use E4M3 plus one FP32 scale per 128 values. Attention still computes in FP16/BF16 after fused dequantization.</p>
+      </div>
+      <div class="summary-grid">
+        <article class="card summary-card">
+          <span class="kicker">Bytes</span>
+          <strong>About 48.4% less KV traffic</strong>
+          <p>One FP8 byte plus scale metadata costs about 1.031 bytes/value, versus 2 bytes/value for BF16. Host-cache capacity nearly doubles.</p>
+        </article>
+        <article class="card summary-card">
+          <span class="kicker">A800 caveat</span>
+          <strong>Conversion is not free</strong>
+          <p>A800 is Ampere SM80, without Hopper's native FP8 conversion path. The estimate charges fused dequantization and uses an effective cache-path factor of 0.72, not the byte-only 0.516.</p>
+        </article>
+        <article class="card summary-card">
+          <span class="kicker">Admission</span>
+          <strong>Topology sets the ceiling</strong>
+          <p>FP8 KV still saves cache bytes, but the admitted maxima now reflect eight-stage pipeline throughput for Kimi and GLM: 28/14 and 40/30 users at 128K/256K.</p>
+        </article>
+      </div>
+      <div class="callout" id="fp8-result-callout"></div>
+    </section>
+
+    <section aria-labelledby="summary-title">
+      <div class="section-head">
+        <h2 id="summary-title">What the ideal case says</h2>
+      </div>
+      <div class="summary-grid" id="summary-grid">
+        <article class="card summary-card">
+          <span class="kicker">Decode</span>
+          <strong>Concurrency becomes practical</strong>
+          <p>Only 1.56% of the exact cache is consumed per decode step. With context sharding and overlapped prefetch, active batches can grow without keeping every request's full exact KV cache in HBM.</p>
+        </article>
+        <article class="card summary-card">
+          <span class="kicker">Prefill</span>
+          <strong>TTFT remains the bottleneck</strong>
+          <p>ShadowKV does not remove the compute needed to process 128K or 256K prompts. A simultaneous cold-start burst can therefore wait minutes even when later token streaming is acceptable.</p>
+        </article>
+        <article class="card summary-card">
+          <span class="kicker">Pipeline</span>
+          <strong>Low load gets slower</strong>
+          <p>A lone decoder traverses eight stages while only one two-GPU pair is active. Around 50–75% of the admitted batch, independent requests fill most bubbles; beyond that, contention and queue risk dominate.</p>
+        </article>
+      </div>
+    </section>
+
+    <section aria-labelledby="assumptions-title">
+      <div class="section-head">
+        <h2 id="assumptions-title">Assumptions</h2>
+        <p class="section-note" id="assumptions-note">“Perfect condition” means flawless execution of the stated design—not a 100% predictor hit rate. The previously specified 80% hit rate remains in force.</p>
+      </div>
+      <div class="assumption-grid">
+        <article class="card assumption-card">
+          <h3>Hardware and runtime</h3>
+          <ul>
+            <li>Each node has 8× NVIDIA A800 80 GB, approximately 640 GB nominal aggregate HBM; Kimi and GLM consume two IB-connected nodes, while V4 Flash consumes one.</li>
+            <li>Approximately 31.5 GB/s usable one-way PCIe Gen4 bandwidth per GPU and sufficient CPU DRAM/NUMA bandwidth.</li>
+            <li>400 Gb/s InfiniBand is modeled as approximately 40 GB/s usable one-way payload bandwidth. Stages 1–4 are on server A and 5–8 on server B, so pipeline parallelism crosses IB once per forward pass.</li>
+            <li>1 TB system RAM per node, with exact caches sharded across GPU-local NUMA regions rather than replicated for every tensor-parallel rank.</li>
+            <li>Custom serving code, optimized kernels, static knowledge of all requests, and one model deployment at a time.</li>
+          </ul>
+        </article>
+        <article class="card assumption-card">
+          <h3>Model and ShadowKV behavior</h3>
+          <ul id="model-assumptions-list">
+            <li>Official Hugging Face storage formats are retained: Kimi native INT4, GLM FP8, and V4 Flash mixed FP4/FP8. Fused kernels dequantize into registers/shared memory and compute in BF16; no persistent BF16 weight copy is allocated.</li>
+            <li>Exactly 1.56% of context entries are selected: 2,048 at 128K and 4,096 at 256K.</li>
+            <li>One-token-ahead prefetch is 80% correct; 20% of required entries arrive just in time. Wrong prefetches make total transfer approximately 1.2× the useful selected set.</li>
+            <li>Prediction, indexing, reconstruction, communication, and correct prefetch transfers overlap with useful GPU work whenever causally possible.</li>
+            <li>No quality degradation from sparse selection and no pathological attention pattern that defeats the predictor.</li>
+          </ul>
+        </article>
+      </div>
+      <div class="callout" id="assumption-callout"><strong>Critical dependency:</strong> Kimi and GLM are modeled as PP8×TP2, with four contiguous stages per server—not cross-node expert parallel. Their layer groups, exact cache, and shadow representation are stage-local. The central decode curve uses one request per pipeline microbatch; coarser microbatches would leave more bubbles and reduce throughput.</div>
+    </section>
+
+    <section aria-labelledby="models-title">
+      <div class="section-head">
+        <h2 id="models-title">Why the models differ</h2>
+        <p class="section-note">The same 1.56% policy interacts with three substantially different attention/cache designs.</p>
+      </div>
+      <div class="model-grid" id="model-grid">
+        <article class="card model-card">
+          <span class="kicker">Kimi Code 2.7</span>
+          <h3>Largest decode-side upside</h3>
+          <p>Its dense MLA-style long-context attention still pays heavily for cache access. The 595.2 GB native-INT4 checkpoint is too tight for a practical one-node runtime, so PP8×TP2 adds aggregate pipeline capacity once enough requests are in flight.</p>
+          <p><strong>Planning cache:</strong> about 8.6/17.2 GiB exact CPU cache per 128K/256K request. With one eighth of the layers on each TP2 stage, the sharded GPU representation remains roughly 0.23/0.45 GiB per request per GPU.</p>
+          <div class="maxima"><div><span>128K admitted max</span><strong>28 users</strong></div><div><span>256K admitted max</span><strong>14 users</strong></div></div>
+        </article>
+        <article class="card model-card">
+          <span class="kicker">GLM-5.3</span>
+          <h3>Capacity gain more than TPOT gain</h3>
+          <p>GLM already uses a sparse attention indexer. Its 755.6 GB FP8 checkpoint requires two nodes; PP8×TP2 assigns an approximately equal contiguous layer group to each two-GPU stage. Selector state stays in HBM and exact latent cache stays in that stage's node-local RAM.</p>
+          <p><strong>Planning cache:</strong> about 11.0/21.9 GiB exact CPU cache per request. At 256K, 30 users consume roughly 657 GiB, split across the two node-local host-memory pools.</p>
+          <div class="maxima"><div><span>128K admitted max</span><strong>40 users</strong></div><div><span>256K admitted max</span><strong>30 users</strong></div></div>
+        </article>
+        <article class="card model-card">
+          <span class="kicker">DeepSeek V4 Flash</span>
+          <h3>Least incremental ShadowKV benefit</h3>
+          <p>Its native compressed/sparse cache is already small. The high modeled throughput mainly comes from lower active compute and the assumption that two four-GPU replicas fit—not from a dramatic ShadowKV speedup.</p>
+          <p><strong>Planning cache:</strong> offload only the larger ratio-4 portion, approximately 0.66/1.32 GiB per request. Preserve the trained compression and treat 1.56% as a cap where forcing more entries would be wasteful.</p>
+          <div class="maxima"><div><span>128K admitted max</span><strong>64 users</strong></div><div><span>256K admitted max</span><strong>48 users</strong></div></div>
+        </article>
+      </div>
+    </section>
+
+    <section aria-labelledby="explorer-title">
+      <div class="section-head">
+        <h2 id="explorer-title">Interactive load explorer</h2>
+        <p class="section-note" id="explorer-note">Hover any graph for cross-model values. Throughput tooltips use <strong>&lt;total&gt;/&lt;per-user&gt; tok/s</strong>. Move the load control to update the vertical guides and scenario table.</p>
+      </div>
+      <div class="interactive-shell">
+        <div class="controls">
+          <div class="control-group">
+            <div class="control-label"><span>Context shown</span></div>
+            <div class="segmented" role="group" aria-label="Context length">
+              <button type="button" data-context="both" aria-pressed="true">Both</button>
+              <button type="button" data-context="128" aria-pressed="false">128K</button>
+              <button type="button" data-context="256" aria-pressed="false">256K</button>
+            </div>
+          </div>
+          <div class="range-wrap">
+            <label class="control-label" for="load-control"><span>Selected system load</span><strong id="load-value">50% of admitted max</strong></label>
+            <input id="load-control" type="range" min="0" max="100" step="25" value="50">
+            <div class="range-ticks" aria-hidden="true"><span>1 user</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span></div>
+          </div>
+        </div>
+        <div id="legend" class="legend" aria-label="Toggle model and context series"></div>
+
+        <div class="chart-grid">
+          <article class="chart-card">
+            <h3 class="chart-title">Output throughput — aggregate system</h3>
+            <p class="chart-subtitle" id="aggregate-subtitle">Higher is better; batching raises total tokens delivered.</p>
+            <div class="chart" data-metric="tps"></div>
+            <div class="tooltip" hidden></div>
+          </article>
+          <article class="chart-card">
+            <h3 class="chart-title">Output throughput — per user</h3>
+            <p class="chart-subtitle" id="per-user-subtitle">Higher is better; PP8 fill initially helps each user before contention takes over.</p>
+            <div class="chart" data-metric="userTps"></div>
+            <div class="tooltip" hidden></div>
+          </article>
+          <article class="chart-card">
+            <h3 class="chart-title">Streaming latency after prefill</h3>
+            <p class="chart-subtitle">TPOT; 50 ms ≈ 20 tok/s and 100 ms ≈ 10 tok/s.</p>
+            <div class="chart" data-metric="tpot"></div>
+            <div class="tooltip" hidden></div>
+          </article>
+          <article class="chart-card">
+            <h3 class="chart-title">Cold-start TTFT for one simultaneous burst</h3>
+            <p class="chart-subtitle">Average under first-token-priority prefill; the tooltip also shows the last user.</p>
+            <div class="chart" data-metric="ttft"></div>
+            <div class="tooltip" hidden></div>
+          </article>
+        </div>
+
+        <div class="scenario">
+          <h3 id="scenario-title">Selected scenario: 50% of admitted max</h3>
+          <div class="table-wrap">
+            <table aria-describedby="scenario-title">
+              <thead><tr><th>Candidate</th><th>Active requests</th><th>Total/per-user throughput</th><th>TPOT</th><th>Average TTFT</th><th>Last-user TTFT</th><th>Average 512-token completion</th></tr></thead>
+              <tbody id="scenario-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section aria-labelledby="method-title">
+      <div class="section-head">
+        <h2 id="method-title">Method and interpretation</h2>
+      </div>
+      <div class="method-grid">
+        <article class="card">
+          <h3>How the displayed metrics are derived</h3>
+          <span class="formula">per-user throughput = aggregate output throughput ÷ active requests</span>
+          <span class="formula">TPOT (ms/token) = 1000 ÷ per-user throughput</span>
+          <span class="formula">average burst TTFT ≈ pipeline-aware single-prompt TTFT × (requests per replica + 1) ÷ 2</span>
+          <span class="formula">average 512-token completion = average TTFT + 511 × TPOT</span>
+          <p>For Kimi and GLM, the single-prompt center includes chunked PP8 overlap during prefill; they each remain one logical model replica. Decode cannot pipeline successive tokens from one user because of the autoregressive dependency. Flash has two replicas. The scheduler prioritizes first tokens.</p>
+        </article>
+        <article class="card">
+          <h3>Metric definitions</h3>
+          <dl class="definition-list">
+            <dt>TTFT</dt><dd>Time from admission until the first generated token, including prompt prefill and queueing inside the closed burst.</dd>
+            <dt>TPOT</dt><dd>Steady-state time between generated tokens after prefill.</dd>
+            <dt>Total tok/s</dt><dd>Tokens produced by the entire model deployment across all active requests—two nodes for Kimi/GLM and one node for V4 Flash.</dd>
+            <dt>Per-user tok/s</dt><dd>Fair-share generation rate for one continuously decoding request.</dd>
+            <dt>100% load</dt><dd>One closed batch at the chosen admission ceiling—not stable 100% arrival-rate utilization.</dd>
+          </dl>
+        </article>
+      </div>
+      <div class="callout"><strong>Queueing warning:</strong> at sustained 100% offered utilization, mean queue delay has no finite bound. A real service needs admission control, prompt-length-aware scheduling, and reserved prefill capacity even if every request is known in advance.</div>
+    </section>
+
+    <section aria-labelledby="math-title">
+      <div class="section-head">
+        <h2 id="math-title">Detailed estimation model</h2>
+        <p class="section-note">The expandable derivation makes every major scaling assumption explicit and separates calculated quantities from calibrated performance estimates.</p>
+      </div>
+      <details class="math-details" id="estimation-model">
+        <summary>
+          <span class="summary-copy" id="math-summary-copy">Show the mathematical model and model-specific reasoning<small>Official weight bytes, PP8×TP2, selection, pipeline bubbles, PCIe/IB traffic, throughput, TTFT, and queueing</small></span>
+        </summary>
+        <div class="math-body" id="math-body">
+          <h3>1. Sparse working-set size</h3>
+          <p>Let \(N\) be the prompt length, \(\alpha=0.015625=1/64\) the selected fraction, \(L\) the number of cache-bearing layers, \(P\) pipeline stages, \(d_c\) the exact cached latent width, \(b=2\) bytes per FP16/BF16 element, and \(G_s\) GPUs per stage. The selected entries per decode token are</p>
+          \[
+            S(N)=\alpha N,
+            \qquad
+            S(131{,}072)=2{,}048,
+            \qquad
+            S(262{,}144)=4{,}096.
+          \]
+          <p>The useful selected-cache payload after ideal context sharding is</p>
+          \[
+            B_{\mathrm{sel,stage}}(N)=\frac{S(N)\,(L/P)\,d_c\,b}{G_s}.
+          \]
+
+          <h3>2. Prefetch accuracy and PCIe traffic</h3>
+          <p>Let \(h=0.8\) be the one-token-ahead prefetch hit rate. The predictor fetches one set of \(S\) entries. Of those, \(hS\) are useful and \((1-h)S\) are false positives; another \((1-h)S\) required entries arrive just in time. Therefore</p>
+          \[
+            B_{\mathrm{total}}=(2-h)B_{\mathrm{sel}}=1.2B_{\mathrm{sel}},
+            \qquad
+            B_{\mathrm{JIT}}=(1-h)B_{\mathrm{sel}}=0.2B_{\mathrm{sel}}.
+          \]
+          <p>In the ideal overlap case, total traffic determines sustainable throughput, but only \(B_{\mathrm{JIT}}\) is necessarily exposed on the critical path. With per-GPU usable PCIe bandwidth \(\beta_{\mathrm{PCIe}}\approx31.5\ \mathrm{GB/s}\), the irreducible miss penalty is approximated by</p>
+          \[
+            t_{\mathrm{JIT}}\approx\frac{B_{\mathrm{JIT}}}{\beta_{\mathrm{PCIe}}}.
+          \]
+          <div class="table-wrap">
+            <table class="math-table">
+              <thead><tr><th>Offloaded exact cache path</th><th>\(L\)</th><th>\(d_c\)</th><th>\(B_{\mathrm{sel}}\)/GPU at 128K / 256K</th><th>\(t_{\mathrm{JIT}}\) at 128K / 256K</th></tr></thead>
+              <tbody>
+                <tr><td>Kimi MLA latent, PP8×TP2</td><td>61</td><td>576</td><td>8.6 / 17.2 MiB</td><td>0.05 / 0.11 ms</td></tr>
+                <tr><td>GLM main latent, PP8×TP2</td><td>78</td><td>576</td><td>11.0 / 21.9 MiB</td><td>0.07 / 0.14 ms</td></tr>
+                <tr><td>V4 Flash ratio-4 layers, four-GPU replica</td><td>21</td><td>512</td><td>10.5 / 21.0 MiB</td><td>0.07 / 0.13 ms</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="math-note">These small miss-only times do not prove the transfers are free. At high batch size, \(1.2B_{\mathrm{sel}}\) for every active sequence competes for PCIe and CPU-memory bandwidth. The estimate requires NUMA-local cache shards and full overlap of the predicted 80%.</p>
+
+          <h3>3. Memory and admission capacity</h3>
+          <p>For admitted concurrency \(C\), the simplified per-node HBM and host-memory constraints are</p>
+          \[
+            M_{\mathrm{HBM,node}} \approx
+            \frac{M_W}{N_{\mathrm{node}}}
+            + M_{\mathrm{runtime}}
+            + C\frac{M_{\mathrm{shadow}}(N)}{N_{\mathrm{node}}}
+            \le 640\ \mathrm{GB},
+          \]
+          \[
+            M_{\mathrm{CPU}} \approx
+            M_{\mathrm{staging,node}}
+            + C\frac{M_{\mathrm{exact}}(N)}{N_{\mathrm{node}}}
+            \le 1\ \mathrm{TiB}.
+          \]
+          <p>Here \(M_W\) is the actual official safetensor total: 595.2 GB for Kimi native INT4, 755.6 GB for GLM FP8, and 159.6 GB for V4 Flash mixed FP4/FP8. Kimi and GLM use \(N_{\mathrm{node}}=2\), \(P=8\), and \(G_s=2\): four stages per node. V4 Flash uses two independent four-GPU replicas, \(R=2\), on one node. \(M_{\mathrm{runtime}}\) covers activations, communication buffers, kernels, and allocator headroom.</p>
+          <p>The displayed “max” is not the largest integer satisfying memory alone. It is an admission ceiling chosen at the earlier of the memory limit and the throughput knee:</p>
+          \[
+            C_{\max}=
+            \min\!\left(
+              C_{\mathrm{HBM}},
+              C_{\mathrm{DRAM}},
+              C_{\mathrm{PCIe}},
+              C_{\mathrm{knee}}
+            \right).
+          \]
+          <div class="math-step">
+            <strong>Resulting admission ceilings</strong>
+            <p>Kimi: \(C_{\max}=28/14\), GLM: \(C_{\max}=40/30\), and V4 Flash: \(C_{\max}=64/48\) for 128K/256K respectively. These are throughput/latency admission knees, not the largest values that fit in memory.</p>
+          </div>
+
+          <h3>4. Decode-time roofline and throughput</h3>
+          <p>For active batch \(C\), decode step time is modeled as the slowest relevant resource path plus non-overlapped coordination:</p>
+          \[
+            T_{\mathrm{step}}(C,N)\approx
+            \max\!\left[
+              \frac{F_{\mathrm{token}}(C)}{P_{\mathrm{eff}}},
+              \frac{B_{\mathrm{HBM}}(C,N)}{\beta_{\mathrm{HBM,eff}}},
+              \frac{B_{\mathrm{PCIe}}(C,N)}{\beta_{\mathrm{PCIe,eff}}}
+            \right]
+            + t_{\mathrm{collective}}.
+          \]
+          <p>The total and fair-share output rates then follow directly:</p>
+          \[
+            Y_{\mathrm{total}}(C,N)=\frac{C}{T_{\mathrm{step}}(C,N)},
+            \qquad
+            Y_{\mathrm{user}}(C,N)=\frac{Y_{\mathrm{total}}(C,N)}{C},
+            \qquad
+            \mathrm{TPOT}=\frac{1000}{Y_{\mathrm{user}}}\ \mathrm{ms}.
+          \]
+          <p>The report does not claim exact values for \(P_{\mathrm{eff}}\), \(\beta_{\mathrm{HBM,eff}}\), or collective efficiency without an A800 measurement. Instead, it uses architecture-informed center points at one user and 25/50/75/100% of \(C_{\max}\). This is why the resulting throughput/TPOT curves carry approximately ±30–50% uncertainty.</p>
+
+          <h3>5. Model-specific calibration logic</h3>
+          <div class="math-step">
+            <strong>Kimi Code 2.7</strong>
+            <p>Dense long-context attention makes \(B_{\mathrm{HBM}}\) large. The native-INT4 checkpoint uses 595.2 GB before runtime allocations, so it is split across two nodes. PP8 needs several independent sequences to fill its eight stages; one-user decode uses only one TP2 pair at a time and is approximately four times slower than the earlier PP2×TP8 one-user path.</p>
+          </div>
+          <div class="math-step">
+            <strong>GLM-5.3</strong>
+            <p>Its native sparse indexer already reduces attention work. The 755.6 GB FP8 checkpoint must span two nodes, and software FP8-to-BF16 conversion on SM80 increases the weight path relative to the earlier ideal-W4 baseline. Pipeline overlap recovers throughput at moderate batch, but single-user TPOT becomes slower.</p>
+          </div>
+          <div class="math-step">
+            <strong>DeepSeek V4 Flash</strong>
+            <p>The trained compressed/sparse cache already makes \(B_{\mathrm{HBM}}\) small. Its 159.6 GB mixed FP4/FP8 checkpoint permits two four-GPU replicas, but conversion to BF16 reduces their rates by roughly 3–9% versus the earlier ideal-W4 curves.</p>
+          </div>
+
+          <h3>6. Cold-start TTFT</h3>
+          <p>Let \(T_0(N)\) be the estimated single-request prefill time and let \(R\) be the number of model replicas. For a simultaneous closed burst of \(C\) requests, balanced across replicas, define</p>
+          \[
+            c_r=\left\lceil\frac{C}{R}\right\rceil.
+          \]
+          <p>If full-length prompts already saturate each replica and the scheduler minimizes mean first-token time by completing prefills in first-token-priority order, then</p>
+          \[
+            \overline{\mathrm{TTFT}}_{\mathrm{burst}}
+            \approx T_0(N)\frac{c_r+1}{2},
+            \qquad
+            \mathrm{TTFT}_{\mathrm{last}}
+            \approx T_0(N)c_r.
+          \]
+          <p>Long prompts are split into 4K-token prefill chunks, giving about 32/64 microbatches at 128K/256K. PP8 prefill efficiency is therefore approximately \(32/39\) and \(64/71\), so the revised single-user centers are \(16.6/43.2\) s for Kimi, \(14.3/28.7\) s for GLM, and \(7.3/14.6\) s for V4 Flash. These are optimistic custom-runtime centers, not measured results.</p>
+          \[
+            T_{\mathrm{complete},512}
+            \approx \overline{\mathrm{TTFT}}_{\mathrm{burst}}
+            +511\frac{\mathrm{TPOT}}{1000}.
+          \]
+
+          <h3>7. Why full utilization is not an SLO</h3>
+          <p>The graph's 100% point is a finite, closed batch. A continuously arriving service is different. A generic queueing approximation contains the factor</p>
+          \[
+            W_q \propto \frac{\rho}{1-\rho},
+            \qquad \lim_{\rho\to1^-}W_q=\infty,
+          \]
+          <p>where \(\rho\) is offered utilization. Real long-prompt service times are highly variable, so the exact queue is not this simple; the divergence is the reason to preserve 25–50% operational headroom for prefills, misses, and burst absorption.</p>
+        </div>
+      </details>
+    </section>
+
+    <section aria-labelledby="guidance-title">
+      <div class="section-head">
+        <h2 id="guidance-title">Recommended interactive envelope</h2>
+        <p class="section-note">These are operating targets, not hard hardware limits.</p>
+      </div>
+      <div class="card table-wrap">
+        <table class="guidance-table">
+          <thead><tr><th>Candidate</th><th>Suggested active decoders</th><th>Expected experience after prefill</th><th>Main risk</th></tr></thead>
+          <tbody id="guidance-body">
+            <tr><td>Kimi Code 2.7 · 128K / 256K</td><td>14–21 / 7–11</td><td><span class="good">Acceptable</span>, roughly 11–16 tok/s</td><td>PP8 bubbles below this range and dense long-prompt prefill</td></tr>
+            <tr><td>GLM-5.3 · 128K / 256K</td><td>10–20 / 8–15</td><td><span class="warn">Slow</span>, roughly 7–8 tok/s</td><td>FP8 weight conversion on SM80 and PP8 stage balance</td></tr>
+            <tr><td>DeepSeek V4 Flash · 128K / 256K</td><td>≤32 / ≤24 across two replicas</td><td><span class="warn">Acceptable</span>, roughly 13–15 tok/s</td><td>ShadowKV adds little over the native compressed cache</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section aria-labelledby="limits-title">
+      <div class="section-head">
+        <h2 id="limits-title">Uncertainty and exclusions</h2>
+      </div>
+      <article class="card">
+        <ul class="limits-list" id="limits-list">
+          <li><strong>Not an A800 benchmark:</strong> aggregate throughput and TPOT should be treated as planning centers with approximately ±30–50% uncertainty; cold TTFT may vary by at least ±50%.</li>
+          <li><strong>Steady decode and cold prefill are separated:</strong> the decode graphs assume requests have completed prefill. Mixing new 128K/256K prefills into a full decode batch will cause TPOT spikes unless capacity is reserved.</li>
+          <li><strong>Checkpoint bytes are measured, runtime bytes are modeled:</strong> official safetensor totals are 595.2 GB for Kimi, 755.6 GB for GLM, and 159.6 GB for V4 Flash. Allocator alignment, duplicated metadata, kernels, and communication workspaces can raise HBM use.</li>
+          <li><strong>Pipeline topology is assumed:</strong> Kimi and GLM use PP8×TP2, with stages 1–4 on one node and 5–8 on the other. The central curve uses one independently schedulable request per decode microbatch; larger microbatches increase bubbles.</li>
+          <li><strong>Stages must be time-balanced:</strong> equal layer counts need not mean equal work in a heterogeneous MoE model. The runtime should choose contiguous boundaries from measured stage time and weight footprint; the slowest stage sets pipeline cadence.</li>
+          <li><strong>Host RAM matters:</strong> each node is assumed to have 1 TB. Official weight staging and exact caches must remain node-local to their pipeline stage and be released or streamed carefully.</li>
+          <li><strong>Quality is assumed:</strong> the analysis does not prove that a fixed 1.56% selection policy preserves accuracy on these models and workloads.</li>
+          <li><strong>Excluded latency:</strong> tokenization, API/network transit, detokenization, request logging, failures, retries, and multi-tenant isolation are not included.</li>
+        </ul>
+      </article>
+    </section>
+
+    <p class="footnote" id="case-footnote">This page covers only Case A: one-token-ahead prediction with an 80% prefetch hit rate. Official Hugging Face checkpoint formats are dequantized for BF16 compute; Kimi and GLM use two-node PP8×TP2 with four contiguous stages per node, while V4 Flash uses two four-GPU replicas on one node. Scope intentionally excludes DeepSeek V4 Pro.</p>
+  </main>
+
+  <script>
+    (() => {
+      const loads = [0, 25, 50, 75, 100];
+      let caseMode = location.hash.includes('fetch-at-decode') ? 'fetch' : 'ahead';
+      let storageMode = location.hash.includes('fp8-kv') ? 'fp8' : 'bf16';
+      const data = [
+        { id:'kimi-128', name:'Kimi Code 2.7', short:'Kimi 128K', context:128, max:28, color:'var(--s1)', tps:[6,95,211,295,353], userTps:[6.00,13.57,15.07,14.05,12.61], tpot:[166.7,73.7,66.4,71.2,79.3], fetch:{tps:[5,68,144,193,227], userTps:[5.00,9.71,10.29,9.19,8.11], tpot:[200.0,103.0,97.2,108.8,123.3]}, fp8:{ahead:{tps:[6,101,228,324,392], userTps:[6.00,14.43,16.29,15.43,14.00], tpot:[166.7,69.3,61.4,64.8,71.4]}, fetch:{tps:[5,71,150,205,241], userTps:[5.00,10.14,10.71,9.76,8.61], tpot:[200.0,98.6,93.4,102.5,116.1]}}, ttft:[16.6,66.4,124.5,182.6,240.7], last:[16.6,116.2,232.4,348.6,464.8] },
+        { id:'kimi-256', name:'Kimi Code 2.7', short:'Kimi 256K', context:256, max:14, color:'var(--s2)', tps:[5,30,77,129,171], userTps:[5.00,7.50,11.00,11.73,12.21], tpot:[200.0,133.3,90.9,85.3,81.9], fetch:{tps:[4,21,49,78,99], userTps:[4.00,5.25,7.00,7.09,7.07], tpot:[250.0,190.5,142.9,141.0,141.4]}, fp8:{ahead:{tps:[5,33,84,146,194], userTps:[5.00,8.25,12.00,13.27,13.86], tpot:[200.0,121.2,83.3,75.4,72.2]}, fetch:{tps:[4,22,51,83,105], userTps:[4.00,5.50,7.29,7.55,7.50], tpot:[250.0,181.8,137.2,132.5,133.3]}}, ttft:[43.2,108.0,172.8,259.2,324.0], last:[43.2,172.8,302.4,475.2,604.8] },
+        { id:'glm-128', name:'GLM-5.3', short:'GLM 128K', context:128, max:40, color:'var(--s3)', tps:[3,77,157,216,260], userTps:[3.00,7.70,7.85,7.20,6.50], tpot:[333.3,129.9,127.4,138.9,153.8], fetch:{tps:[2,57,108,143,167], userTps:[2.00,5.70,5.40,4.77,4.17], tpot:[500.0,175.4,185.2,209.6,239.8]}, fp8:{ahead:{tps:[3,78,163,224,271], userTps:[3.00,7.80,8.15,7.47,6.78], tpot:[333.3,128.2,122.7,133.9,147.5]}, fetch:{tps:[2,58,111,148,173], userTps:[2.00,5.80,5.55,4.93,4.33], tpot:[500.0,172.4,180.2,202.8,230.9]}}, ttft:[14.3,78.7,150.2,221.7,293.2], last:[14.3,143.0,286.0,429.0,572.0] },
+        { id:'glm-256', name:'GLM-5.3', short:'GLM 256K', context:256, max:30, color:'var(--s4)', tps:[2,56,121,176,211], userTps:[2.00,7.00,8.07,7.65,7.03], tpot:[500.0,142.9,123.9,130.7,142.2], fetch:{tps:[2,37,70,95,109], userTps:[2.00,4.63,4.67,4.13,3.63], tpot:[500.0,216.0,214.1,242.1,275.5]}, fp8:{ahead:{tps:[2,59,126,185,224], userTps:[2.00,7.38,8.40,8.04,7.47], tpot:[500.0,135.5,119.0,124.4,133.9]}, fetch:{tps:[2,38,73,98,112], userTps:[2.00,4.75,4.87,4.26,3.73], tpot:[500.0,210.5,205.3,234.7,268.1]}}, ttft:[28.7,129.2,229.6,344.4,444.9], last:[28.7,229.6,430.5,660.1,861.0] },
+        { id:'flash-128', name:'DeepSeek V4 Flash', short:'V4 Flash 128K', context:128, max:64, color:'var(--s5)', tps:[41,282,403,475,514], userTps:[41,17.63,12.59,9.90,8.03], tpot:[24.4,56.7,79.4,101.0,124.5], fetch:{tps:[35,243,340,394,423], userTps:[35,15.19,10.63,8.21,6.61], tpot:[28.6,65.8,94.1,121.8,151.3]}, fp8:{ahead:{tps:[41,286,409,483,525], userTps:[41,17.88,12.78,10.06,8.20], tpot:[24.4,55.9,78.2,99.4,122.0]}, fetch:{tps:[35,245,343,400,431], userTps:[35,15.31,10.72,8.33,6.73], tpot:[28.6,65.3,93.3,120.0,148.6]}}, ttft:[7.3,32.8,61.9,91.0,120.1], last:[7.3,58.2,116.5,174.7,232.9] },
+        { id:'flash-256', name:'DeepSeek V4 Flash', short:'V4 Flash 256K', context:256, max:48, color:'var(--s6)', tps:[36,226,336,403,437], userTps:[36,18.83,14.00,11.19,9.10], tpot:[27.8,53.1,71.4,89.4,109.9], fetch:{tps:[30,179,254,298,318], userTps:[30,14.92,10.58,8.28,6.63], tpot:[33.3,67.0,94.5,120.8,150.8]}, fp8:{ahead:{tps:[36,228,342,410,446], userTps:[36,19.00,14.25,11.39,9.29], tpot:[27.8,52.6,70.2,87.8,107.6]}, fetch:{tps:[30,180,258,302,325], userTps:[30,15.00,10.75,8.39,6.77], tpot:[33.3,66.7,93.0,119.2,147.7]}}, ttft:[14.6,51.0,94.6,138.3,182.0], last:[14.6,87.4,174.7,262.1,349.4] }
+      ];
+      const chartConfig = {
+        tps: { unit:'tokens/second', digits:0 },
+        userTps: { unit:'tokens/second/user', digits:1 },
+        tpot: { unit:'ms/token', digits:0 },
+        ttft: { unit:'seconds', digits:0 }
+      };
+      const enabled = new Set(data.map(d => d.id));
+      let contextFilter = 'both';
+      let selectedLoad = 50;
+      const legend = document.getElementById('legend');
+      const loadControl = document.getElementById('load-control');
+      const loadValue = document.getElementById('load-value');
+      const scenarioTitle = document.getElementById('scenario-title');
+      const scenarioBody = document.getElementById('scenario-body');
+      const ui = {
+        eyebrow: document.getElementById('case-eyebrow'),
+        title: document.getElementById('case-title'),
+        hero: document.getElementById('case-hero-copy'),
+        kvFormatChip: document.getElementById('kv-format-chip'),
+        modeChip: document.getElementById('case-mode-chip'),
+        reuseChip: document.getElementById('case-reuse-chip'),
+        statusChip: document.getElementById('case-status-chip'),
+        summaryTitle: document.getElementById('summary-title'),
+        summaryGrid: document.getElementById('summary-grid'),
+        assumptionsNote: document.getElementById('assumptions-note'),
+        assumptionsList: document.getElementById('model-assumptions-list'),
+        assumptionCallout: document.getElementById('assumption-callout'),
+        modelGrid: document.getElementById('model-grid'),
+        explorerNote: document.getElementById('explorer-note'),
+        aggregateSubtitle: document.getElementById('aggregate-subtitle'),
+        perUserSubtitle: document.getElementById('per-user-subtitle'),
+        mathSummary: document.getElementById('math-summary-copy'),
+        mathBody: document.getElementById('math-body'),
+        guidanceBody: document.getElementById('guidance-body'),
+        limitsList: document.getElementById('limits-list'),
+        footnote: document.getElementById('case-footnote'),
+        fp8Summary: document.getElementById('fp8-summary'),
+        fp8Result: document.getElementById('fp8-result-callout')
+      };
+      const aheadCase = {
+        documentTitle: 'Case A: ShadowKV Token-Ahead — PP8×TP2 A800 Estimate',
+        eyebrow: ui.eyebrow.textContent,
+        title: ui.title.textContent,
+        hero: ui.hero.textContent,
+        modeChip: ui.modeChip.textContent,
+        statusChip: ui.statusChip.textContent,
+        summaryTitle: ui.summaryTitle.textContent,
+        summaryGrid: ui.summaryGrid.innerHTML,
+        assumptionsNote: ui.assumptionsNote.textContent,
+        assumptionsList: ui.assumptionsList.innerHTML,
+        assumptionCallout: ui.assumptionCallout.innerHTML,
+        modelGrid: ui.modelGrid.innerHTML,
+        explorerNote: ui.explorerNote.innerHTML,
+        aggregateSubtitle: ui.aggregateSubtitle.textContent,
+        perUserSubtitle: ui.perUserSubtitle.textContent,
+        mathSummary: ui.mathSummary.innerHTML,
+        mathBody: ui.mathBody.innerHTML,
+        guidanceBody: ui.guidanceBody.innerHTML,
+        limitsList: ui.limitsList.innerHTML,
+        footnote: ui.footnote.textContent
+      };
+      const fetchCase = {
+        documentTitle: 'Case B: ShadowKV Fetch-at-Decode — PP8×TP2 A800 Estimate',
+        eyebrow: 'Case B · fetch at decode time',
+        title: 'ShadowKV without token-ahead prediction',
+        hero: 'A conservative estimate using official Hugging Face weight formats and BF16 compute. Kimi and GLM span two IB-connected 8×A800 nodes; V4 Flash uses one node. Each selected layer must score landmarks, identify misses, fetch or reconstruct entries, and only then execute sparse attention.',
+        modeChip: 'No token-ahead prefetch',
+        statusChip: 'Conservative model, not benchmarked',
+        summaryTitle: 'What fetch-at-decode changes',
+        summaryGrid: `
+          <article class="card summary-card">
+            <span class="kicker">Memory</span>
+            <strong>Admission capacity is preserved</strong>
+            <p>The sparse working set and CPU offload still permit the same large active batches. Removing lookahead does not put the full exact cache back in HBM.</p>
+          </article>
+          <article class="card summary-card">
+            <span class="kicker">Critical path</span>
+            <strong>Every decode step gains a barrier</strong>
+            <p>Landmark scoring, max/top-K, and miss discovery happen before cache reconstruction or transfer. Key and value branches can overlap, but attention waits for both.</p>
+          </article>
+          <article class="card summary-card">
+            <span class="kicker">Consequence</span>
+            <strong>GLM degrades most at high load</strong>
+            <p>Its 78 selector-bearing layers accumulate the largest serialized cost. Kimi also loses substantial throughput; V4 Flash pays fewer such barriers.</p>
+          </article>`,
+        assumptionsNote: 'This case removes next-token prediction entirely. It retains ShadowKV-style temporal reuse after current-token selection, calibrated to the paper’s roughly 60% reduction in reconstruction and data movement.',
+        assumptionsList: `
+            <li>Official Hugging Face storage formats are retained: Kimi native INT4, GLM FP8, and V4 Flash mixed FP4/FP8. Weights are fused-dequantized for BF16 compute without a persistent BF16 copy.</li>
+            <li>Exactly 1.56% of context entries are selected: 2,048 at 128K and 4,096 at 256K.</li>
+            <li>No cache indices are predicted ahead. Current-query landmark selection and miss discovery must finish before exact-cache movement starts.</li>
+            <li>The central estimate assumes 60% temporal reuse, so 40% of the selected working set is rebuilt or fetched each step.</li>
+            <li>Key reconstruction/loading and value fetching overlap with each other; their maximum, not their sum, is exposed. Neither overlaps the subsequent attention for that layer.</li>
+            <li>Selector latency is calibrated conservatively from ShadowKV Table 13: 0.80 ms per Llama block at 24×128K and 0.88 ms at 12×256K.</li>
+            <li>No quality degradation from sparse selection and no pathological attention pattern.</li>`,
+        assumptionCallout: '<strong>Critical path:</strong> for every selected layer, t<sub>layer</sub> = t<sub>QKV</sub> + t<sub>select</sub> + max(t<sub>K</sub>, t<sub>V</sub>) + t<sub>attention</sub> + t<sub>FFN</sub>. Kimi and GLM use PP8×TP2 with four contiguous stages per node. The central curve schedules one request per decode microbatch; routing experts across IB is outside this estimate.',
+        modelGrid: `
+        <article class="card model-card">
+          <span class="kicker">Kimi Code 2.7</span>
+          <h3>Selection becomes visible</h3>
+          <p>The sparse working set still removes most dense attention traffic, but 61 sequential layer selectors and current-token cache fetches remain visible. Eight stages need enough independent requests to amortize pipeline bubbles. Full-admission TPOT is about 123/141 ms at 128K/256K.</p>
+          <p><strong>Planning cache:</strong> about 8.6/17.2 GiB exact CPU cache per request. With one eighth of the layers on each TP2 stage, the sharded GPU representation remains roughly 0.23/0.45 GiB per request per GPU.</p>
+          <div class="maxima"><div><span>128K admitted max</span><strong>28 users</strong></div><div><span>256K admitted max</span><strong>14 users</strong></div></div>
+        </article>
+        <article class="card model-card">
+          <span class="kicker">GLM-5.3</span>
+          <h3>Serialized index cost dominates</h3>
+          <p>Offloading the exact latent cache still raises capacity, but current-query selection across 78 layers cannot be hidden. FP8 weight conversion and PP8 bubbles compound at low load. Full-admission TPOT reaches about 240/276 ms.</p>
+          <p><strong>Planning cache:</strong> about 11.0/21.9 GiB exact CPU cache per request. At 256K, 30 users consume roughly 657 GiB, split across two node-local host pools.</p>
+          <div class="maxima"><div><span>128K admitted max</span><strong>40 users</strong></div><div><span>256K admitted max</span><strong>30 users</strong></div></div>
+        </article>
+        <article class="card model-card">
+          <span class="kicker">DeepSeek V4 Flash</span>
+          <h3>Smallest serialization penalty</h3>
+          <p>Only the larger ratio-4 path is modeled as selected and offloaded across 21 layers. Two four-GPU replicas remain, while official mixed-weight conversion moves full-load TPOT to about 151/151 ms.</p>
+          <p><strong>Planning cache:</strong> offload only the ratio-4 portion, approximately 0.66/1.32 GiB per request. Preserve the trained compression and use 1.56% as a cap.</p>
+          <div class="maxima"><div><span>128K admitted max</span><strong>64 users</strong></div><div><span>256K admitted max</span><strong>48 users</strong></div></div>
+        </article>`,
+        explorerNote: 'Hover any graph for cross-model values. Throughput tooltips use <strong>&lt;total&gt;/&lt;per-user&gt; tok/s</strong>. These curves include serialized landmark selection and cache materialization on every decode step.',
+        aggregateSubtitle: 'Higher is better; serialized selection makes the batching curve flatten earlier.',
+        perUserSubtitle: 'Higher is better; PP8 fill initially helps, then serialized selection and contention take over.',
+        mathSummary: 'Show the fetch-at-decode model and calibration<small>Official weight bytes, PP8×TP2, pipeline bubbles, critical-path ordering, selector timing, throughput, TTFT, and sensitivity</small>',
+        mathBody: String.raw`
+          <h3>1. Sparse working set and missing payload</h3>
+          <p>Let \(N\) be prompt length, \(\alpha=0.015625=1/64\) the selected fraction, \(L\) the selected/offloaded layer count, \(P\) pipeline stages, \(d_c\) the exact cached width, \(b=2\) bytes, and \(G_s\) GPUs per stage or replica. Kimi and GLM use \(P=8,G_s=2\); each Flash replica uses \(P=1,G_s=4\). The selected entries per sequence are</p>
+          \[
+            S(N)=\alpha N,\qquad S(128\mathrm{K})=2{,}048,\qquad S(256\mathrm{K})=4{,}096.
+          \]
+          <p>There is no predictor hit rate in this case. Let \(r=0.60\) be temporal reuse in the resident sparse buffer. Let \(C_s=C\) for a pipeline stage and \(C_s=\lceil C/R\rceil\) for a replicated Flash worker. The entries that must be materialized for the current token are</p>
+          \[
+            S_{\mathrm{miss}}=(1-r)S=0.4S,
+            \qquad
+            B_{\mathrm{miss,stage}}(C,N)=\frac{C_s(1-r)S(N)(L/P)d_cb}{G_s}.
+          \]
+          <div class="table-wrap">
+            <table class="math-table">
+              <thead><tr><th>Exact-cache path</th><th>\(L\)</th><th>\(d_c\)</th><th>Full selected payload/GPU/request, 128K / 256K</th><th>40% miss time/request</th></tr></thead>
+              <tbody>
+                <tr><td>Kimi MLA latent, PP8×TP2</td><td>61</td><td>576</td><td>8.6 / 17.2 MiB</td><td>0.12 / 0.23 ms</td></tr>
+                <tr><td>GLM main latent, PP8×TP2</td><td>78</td><td>576</td><td>11.0 / 21.9 MiB</td><td>0.15 / 0.29 ms</td></tr>
+                <tr><td>V4 Flash ratio-4 path</td><td>21</td><td>512</td><td>10.5 / 21.0 MiB per four-GPU replica</td><td>0.14 / 0.28 ms</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="math-note">Payload times are per request at 31.5 GB/s usable PCIe bandwidth. At batch size \(C_r\), all misses share the replica links, so materialization grows approximately with \(C_r\).</p>
+
+          <h3>2. Causal ordering inside a layer</h3>
+          <p>The current query must score landmarks, reduce across query groups, choose chunks, and identify misses before exact data can move. Key reconstruction/loading and value fetching may run in parallel; sparse attention waits for the slower branch:</p>
+          \[
+            t_{\mathrm{materialize}}=\max\!\left(t_K,t_V\right),
+          \]
+          \[
+            t_{\mathrm{layer}}=
+            t_{\mathrm{QKV}}+t_{\mathrm{select}}
+            +\max(t_K,t_V)+t_{\mathrm{attention}}+t_{\mathrm{FFN}}.
+          \]
+          <p>For a joint MLA latent, the selected latent is moved once and reconstructs both attention sides. If separate K/V streams saturate one physical link, replace the maximum with their sum.</p>
+
+          <h3>3. Selector calibration from ShadowKV Table 13</h3>
+          <p>The paper reports per-block selection as GEMM+softmax, max reduction, and top-K:</p>
+          \[
+            t_{\mathrm{select},128\mathrm{K}}=0.58+0.07+0.15=0.80\ \mathrm{ms}
+            \quad(24\times128\mathrm{K}),
+          \]
+          \[
+            t_{\mathrm{select},256\mathrm{K}}=0.65+0.07+0.16=0.88\ \mathrm{ms}
+            \quad(12\times256\mathrm{K}).
+          \]
+          <p>The same table supports overlap of reconstruction and fetching: \(\max(1.36,1.66)=1.66\) ms at 24×128K and \(\max(1.49,1.75)=1.75\) ms at 12×256K. A compact interpolation matching both selector points is</p>
+          \[
+            u(C,N)=\frac{C_sN}{24\cdot128\mathrm{K}},
+            \qquad
+            t_{\mathrm{select,block}}=
+            0.12+0.08\log_2\!\left(\frac{N}{128\mathrm{K}}\right)+0.68u
+            \quad\mathrm{ms}.
+          \]
+          <p>This conservatively reuses the Llama selector timing for the frontier-model layers. Efficient native indexers could be faster; unfused custom kernels could be slower.</p>
+
+          <h3>4. End-to-end decode model</h3>
+          <p>Let \(T_{\mathrm{ahead}}(C,N)\) be the step-time center on Case A. Fetch-at-decode exposes both selection and current-token materialization:</p>
+          \[
+            T_{\mathrm{fetch}}(C,N)=T_{\mathrm{ahead}}(C,N)
+            +L_{\mathrm{sel}}t_{\mathrm{select,block}}(C,N,R)
+            +t_{\mathrm{materialize}}(C,N).
+          \]
+          \[
+            Y_{\mathrm{total}}=\frac{1000C}{T_{\mathrm{fetch}}},
+            \qquad
+            Y_{\mathrm{user}}=\frac{Y_{\mathrm{total}}}{C},
+            \qquad
+            \mathrm{TPOT}=\frac{1000}{Y_{\mathrm{user}}}\ \mathrm{ms}.
+          \]
+          <div class="math-step">
+            <strong>Worked point: Kimi, 28×128K</strong>
+            <p>After native-INT4 conversion cost and PP8 pipeline overlap, the BF16-KV Case-A center is 353 tok/s. Exposing current-token selection and materialization lowers the fetch-at-decode center to 227 tok/s, or 8.1 tok/s per user and 123.3 ms TPOT.</p>
+          </div>
+          <div class="math-step">
+            <strong>Full-admission centers, 128K / 256K</strong>
+            <p>With BF16 KV, Kimi falls from 353/171 to 227/99 aggregate tok/s; GLM from 260/211 to 167/109; V4 Flash from 514/437 to 423/318. With FP8 KV, the Case-B totals are 241/105, 173/112, and 431/325 respectively.</p>
+          </div>
+
+          <h3>5. TTFT and completion latency</h3>
+          <p>Long-context prefill still dominates first-token latency, so the rounded TTFT centers remain the same as Case A. For a simultaneous cold burst, balanced across replicas and scheduled first-token-first,</p>
+          \[
+            \overline{\mathrm{TTFT}}_{\mathrm{burst}}\approx T_0(N)\frac{C_r+1}{2},
+            \qquad
+            \mathrm{TTFT}_{\mathrm{last}}\approx T_0(N)C_r,
+          \]
+          \[
+            T_{\mathrm{complete},512}\approx
+            \overline{\mathrm{TTFT}}_{\mathrm{burst}}+511\frac{\mathrm{TPOT}}{1000}.
+          \]
+          <p>Chunked prefill can fill PP8 even for one long prompt. With 4K chunks, revised single-user centers are 16.6/43.2 s for Kimi, 14.3/28.7 s for GLM, and 7.3/14.6 s for V4 Flash at 128K/256K. Fetch-at-decode changes the first-token barrier only slightly relative to these seconds-long centers.</p>
+
+          <h3>6. Sensitivity and queueing</h3>
+          <p><strong>Zero-reuse bound:</strong> with BF16 KV, setting \(r=0\) raises full-load TPOT to roughly 130/149 ms for Kimi, 253/297 ms for GLM, and 159/161 ms for V4 Flash at 128K/256K. Selection remains the dominant added term in this calibration.</p>
+          <p>A 100% graph point is a finite closed batch. For a continuously arriving service, queue delay includes the familiar instability factor</p>
+          \[
+            W_q\propto\frac{\rho}{1-\rho},
+            \qquad \lim_{\rho\to1^-}W_q=\infty.
+          \]
+          <p>Admission control and prefill headroom remain necessary even when all requests are known beforehand.</p>`,
+        guidanceBody: `
+            <tr><td>Kimi Code 2.7 · 128K / 256K</td><td>14–21 / 7–11</td><td><span class="warn">Slow to acceptable</span>, roughly 7–11 tok/s</td><td>Every layer pays current-query selection; PP8 bubbles below this range</td></tr>
+            <tr><td>GLM-5.3 · 128K / 256K</td><td>10–20 / 8–15</td><td><span class="warn">Slow</span>, roughly 4–6 tok/s</td><td>Serialized selection, FP8 weight conversion, and PP8 bubbles</td></tr>
+            <tr><td>DeepSeek V4 Flash · 128K / 256K</td><td>≤32 / ≤24 across two replicas</td><td><span class="warn">Acceptable</span>, roughly 10–11 tok/s</td><td>Full memory admission dilutes each user below 7 tok/s</td></tr>`,
+        limitsList: `
+          <li><strong>Not an A800 benchmark:</strong> selector scaling, aggregate throughput, and TPOT are planning centers with approximately ±40–60% uncertainty; cold TTFT may vary by at least ±50%.</li>
+          <li><strong>Paper-to-model extrapolation:</strong> the serialized selector term uses ShadowKV’s Llama-3-8B per-block measurements without a favorable discount for GLM or Flash native indexers.</li>
+          <li><strong>Steady decode and cold prefill are separated:</strong> fetch-at-decode barely changes TTFT because long prompt prefill is measured in seconds, while its first-token barrier is measured in milliseconds.</li>
+          <li><strong>Checkpoint bytes are measured, runtime bytes are modeled:</strong> official safetensor totals are 595.2 GB for Kimi, 755.6 GB for GLM, and 159.6 GB for V4 Flash.</li>
+          <li><strong>Pipeline topology is assumed:</strong> Kimi and GLM use PP8×TP2 with four contiguous stages per node. The central decode curve assumes one request per microbatch; coarser batching reduces pipeline efficiency.</li>
+          <li><strong>Stages must be time-balanced:</strong> equal layer counts need not mean equal MoE work. Contiguous boundaries should be chosen from measured stage cadence because the slowest of the eight stages limits the whole pipeline.</li>
+          <li><strong>Host RAM matters:</strong> each node is assumed to have 1 TB, with exact caches and any weight staging kept local to its stage.</li>
+          <li><strong>Quality is assumed:</strong> the analysis does not prove that a fixed 1.56% selection policy preserves accuracy on these models and workloads.</li>
+          <li><strong>Excluded latency:</strong> tokenization, API/network transit, detokenization, logging, failures, retries, and multi-tenant isolation are not included.</li>`,
+        footnote: 'Case B has no token-ahead prediction: current-query landmark selection is followed by overlapped key/value materialization and then attention. Official Hugging Face checkpoints are fused-dequantized for BF16 compute; Kimi and GLM use two-node PP8×TP2 with four contiguous stages per node, while V4 Flash uses two four-GPU replicas on one node. DeepSeek V4 Pro remains excluded.'
+      };
+      const weightMath = String.raw`
+        <h3>Official-weight storage and PP8×TP2 two-node overlay</h3>
+        <p>The checkpoint footprint is the sum of the official repository's safetensor files, not parameter count times an assumed precision. Let \(W_i\) be that byte total, \(H=640\ \mathrm{GB}\) nominal HBM per eight-GPU node, and \(R_i\) runtime reserve. Practical node placement is</p>
+        \[
+          n_i=\left\lceil\frac{W_i+R_i}{H}\right\rceil.
+        \]
+        <div class="table-wrap">
+          <table class="math-table">
+            <thead><tr><th>Candidate</th><th>Official storage</th><th>Safetensors</th><th>Placement</th><th>Nominal HBM left after weights</th></tr></thead>
+            <tbody>
+              <tr><td><a href="https://huggingface.co/moonshotai/Kimi-K2.7-Code">Kimi Code 2.7</a></td><td>Native INT4 compressed-tensors</td><td>595.2 GB</td><td>PP8×TP2, four stages/node</td><td>342.4 GB/node</td></tr>
+              <tr><td><a href="https://huggingface.co/zai-org/GLM-5.3">GLM-5.3</a></td><td>FP8 E4M3 mixed with BF16/F32 metadata</td><td>755.6 GB</td><td>PP8×TP2, four stages/node</td><td>262.2 GB/node</td></tr>
+              <tr><td><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash">V4 Flash</a></td><td>FP4 experts + FP8 remainder</td><td>159.6 GB</td><td>Two four-GPU replicas, one node</td><td>160.4 GB/replica</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Kimi's weights alone fit under the nominal 640 GB total, but leave only 44.8 GB across all eight GPUs—about 5.6 GB/GPU—for CUDA graphs, activations, dequantization tiles, collectives, and cache working sets. This estimate therefore treats one-node Kimi as non-operationally tight and assigns it two nodes.</p>
+        <p>PP8×TP2 preserves the earlier per-GPU weight and selected-cache footprint because both layouts divide the model across all 16 GPUs:</p>
+        \[
+          \frac{W}{8\cdot2}=\frac{W}{2\cdot8}=\frac{W}{16},
+          \qquad
+          \frac{L/8}{2}=\frac{L/2}{8}=\frac{L}{16}.
+        \]
+        <p>Each server owns four contiguous stages—half the layers and half the exact host cache. RAM→VRAM traffic remains node-local and fans into the eight local GPUs; it does not traverse IB. Thus the selected bytes per GPU and aggregate bytes per server are unchanged from PP2×TP8. What changes is the pipeline fill schedule. Approximate weight placement is 74.4 GB per Kimi stage (37.2 GB/GPU) and 94.5 GB per GLM stage (47.2 GB/GPU), before runtime buffers.</p>
+        <p>The earlier curves assumed ideal W4 storage. The official-byte ratio and an explicit fused-conversion charge give effective weight-path multipliers</p>
+        \[
+          r_{W,\mathrm{eff}}\approx
+          \begin{cases}
+            1.25 & \text{Kimi INT4},\\
+            2.15 & \text{GLM FP8},\\
+            1.19 & \text{V4 Flash FP4/FP8}.
+          \end{cases}
+        \]
+        <p>If \(f_W\) is the old step-time fraction attributable to weight streaming and conversion, the sequential work inflation is</p>
+        \[
+          D=1+f_W(r_{W,\mathrm{eff}}-1).
+        \]
+        <p>Under PP8×TP2, a stage owns one eighth of the layers but has one quarter as much tensor parallelism as the prior TP8 path. Its stage time is therefore about one half of the prior full-model TP8 time. If \(t_* = \max_j t_j\) is the slowest stage time and \(m\) is the number of independently schedulable decode microbatches, the forward-wave makespan, pipeline efficiency, and throughput multiplier relative to the previous one-node curve are</p>
+        \[
+          T_{\mathrm{wave}}\approx(m+7)t_*,
+          \qquad
+          \eta_{\mathrm{PP8}}(m)=\frac{m}{m+7},
+          \qquad
+          S_{\mathrm{PP8}}(m)=\frac{2m}{(m+7)D}.
+        \]
+        <p>Relative to the prior PP2×TP8 estimate, the bubble-only ratio is \((m+1)/(m+7)\). The central curves add a 3% TP2 collective-efficiency credit, except at one user where six extra NVLink stage handoffs give a 0.24 ratio. At full admission the PP8/PP2 throughput ratios are 0.853 for Kimi 128K, 0.736 for Kimi 256K, 0.899 for GLM 128K, and 0.863 for GLM 256K. Flash placement is unchanged.</p>
+        <p>This is a favorable scheduler bound: it takes \(m=C\), one independently schedulable request per decode microbatch. If the runtime groups \(g\) requests per microbatch, substitute \(m=\lceil C/g\rceil\), increasing bubbles. A single user's successive tokens cannot be used as simultaneous microbatches because token \(t+1\) depends on token \(t\).</p>
+        <p>With hidden width \(h\), the only cross-server PP boundary moves approximately \(2mh\) BF16 bytes per decode wave:</p>
+        \[
+          t_{\mathrm{IB}}\approx \ell_{\mathrm{IB}}+\frac{2mh}{40\ \mathrm{GB/s}}.
+        \]
+        <p>Stages 1–4 reside on server A and 5–8 on server B. The stage-4→5 payload is small—about 0.49 MB for 40 GLM requests—but latency and synchronization still matter. Six additional activation handoffs remain inside the nodes on NVLink. Cross-node expert parallel would communicate at many MoE layers and is deliberately not modeled.</p>
+        <div class="math-step">
+          <strong>Revised admission and prefill centers</strong>
+          <p>Admission ceilings remain 28/14 for Kimi, 40/30 for GLM, and 64/48 for V4 Flash at 128K/256K. With 4K-token prompt chunks, PP8 prefill has 32/39 and 64/71 fill efficiency at 128K/256K. Single-request TTFT centers become 16.6/43.2 s for Kimi, 14.3/28.7 s for GLM, and remain 7.3/14.6 s for V4 Flash.</p>
+        </div>
+        <p class="math-note">These multipliers are analytical calibration points, not measured fused kernels. The largest uncertainty is the fraction \(f_W\), followed by PP stage balance and the real FP8/INT4 unpack throughput on SM80.</p>
+      `;
+
+      const fp8Math = String.raw`
+        <h3>FP8 storage overlay: bytes, dequantization, and calibration</h3>
+        <p>This overlay changes only KV storage; the official model-weight formats and PP/replica placement above are unchanged. Exact host KV and the selected GPU working set use E4M3 values with one FP32 scale per 128 values; queries, accumulators, and attention outputs remain FP16/BF16.</p>
+        <p>Relative to two-byte BF16 storage, the byte ratio including scale metadata is</p>
+        \[
+          q_{\mathrm{bytes}}=
+          \frac{1+4/128}{2}=0.515625.
+        \]
+        <p>A byte-only model would multiply cache movement by 0.516. That is too optimistic on A800: it is an Ampere SM80 GPU, while native PTX E4M3 conversion instructions require SM90 or newer. The central estimate uses a fused load/dequantize/attention kernel and charges enough conversion/pipeline cost to raise the effective cache-path factor to</p>
+        \[
+          q_{\mathrm{eff}}=0.72,
+          \qquad q_{\mathrm{eff}}\in[0.55,0.95]\ \text{as a sensitivity range}.
+        \]
+        <p>Let \(f_{\mathrm{KV}}\) be the fraction of the BF16-storage step time attributable to selected-cache movement and memory-bound attention. For every plotted point,</p>
+        \[
+          T_{\mathrm{FP8}}=
+          T_{\mathrm{BF16}}
+          \left[1-f_{\mathrm{KV}}(1-q_{\mathrm{eff}})\right],
+          \qquad
+          Y_{\mathrm{FP8}}=\frac{1000C}{T_{\mathrm{FP8}}}.
+        \]
+        <div class="table-wrap">
+          <table class="math-table">
+            <thead><tr><th>Candidate</th><th>Case-A full-load \(f_{\mathrm{KV}}\), 128K / 256K</th><th>Case-B full-load \(f_{\mathrm{KV}}\)</th><th>Exact host cache/request, FP8 128K / 256K</th></tr></thead>
+            <tbody>
+              <tr><td>Kimi Code 2.7</td><td>0.35 / 0.43</td><td>0.21 / 0.24</td><td>4.4 / 8.9 GiB</td></tr>
+              <tr><td>GLM-5.3</td><td>0.16 / 0.22</td><td>0.11 / 0.12</td><td>5.7 / 11.3 GiB</td></tr>
+              <tr><td>V4 Flash</td><td>0.07 / 0.08</td><td>0.06 / 0.065</td><td>0.34 / 0.68 GiB</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Case B has a lower \(f_{\mathrm{KV}}\) because current-query landmark selection is serialized and unaffected by KV precision. V4 Flash has the smallest fraction because its trained cache compression already suppresses the relevant traffic.</p>
+        <div class="math-step">
+          <strong>InferSim bandwidth ceiling on the added A800 profile</strong>
+          <p>At 8×128K, its Qwen3-8B fallback changes TPOT from 17.10 to 11.58 ms; at 4×256K, from 16.96 to 11.43 ms—about a 32–33% reduction. InferSim simply halves KV bytes when benchmark data is absent, so those results are an optimistic ceiling, not the values used in the charts.</p>
+        </div>
+        <div class="math-step">
+          <strong>Central full-admission result</strong>
+          <p>Case A aggregate throughput becomes 392/194 tok/s for Kimi, 271/224 for GLM, and 525/446 for V4 Flash at 128K/256K. Case B becomes 241/105, 173/112, and 431/325 respectively. Kimi and GLM totals include PP8 fill efficiency; V4 Flash placement is unchanged.</p>
+        </div>
+        <p class="math-note"><strong>Admission interaction:</strong> FP8 KV nearly doubles raw cache capacity, but the revised 28/14, 40/30, and 64/48 ceilings are still set by pipeline/replica throughput knees and per-user TPOT—not by the last available byte of HBM.</p>
+        <p>Calibration sources: the local <a href="https://github.com/alibaba/InferSim">InferSim</a> source and A800 fallback runs; <a href="https://lenovopress.lenovo.com/lp1813.pdf">Lenovo's A800 specification</a>; and NVIDIA's <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/">PTX ISA documentation</a> for FP8 conversion target support.</p>
+      `;
+
+      function interpolate(values, load) {
+        if (load <= 0) return values[0];
+        if (load >= 100) return values[4];
+        const i = Math.min(3, Math.floor(load / 25));
+        const ratio = (load - loads[i]) / 25;
+        return values[i] + (values[i + 1] - values[i]) * ratio;
+      }
+      function userCount(series, load) {
+        return load === 0 ? 1 : Math.max(1, Math.round(series.max * load / 100));
+      }
+      function loadLabel(load) { return load === 0 ? 'single user' : `${load}% of admitted max`; }
+      function visibleSeries() {
+        return data.filter(d => enabled.has(d.id) && (contextFilter === 'both' || String(d.context) === contextFilter));
+      }
+      function metricValues(series, metric) {
+        if (storageMode === 'fp8' && series.fp8 && series.fp8[caseMode] && series.fp8[caseMode][metric]) return series.fp8[caseMode][metric];
+        if (caseMode === 'fetch' && series.fetch && series.fetch[metric]) return series.fetch[metric];
+        return series[metric];
+      }
+      function niceMax(value) {
+        if (value <= 10) return 10;
+        const power = Math.pow(10, Math.floor(Math.log10(value)));
+        const scaled = value / power;
+        const nice = scaled <= 1 ? 1 : scaled <= 2 ? 2 : scaled <= 5 ? 5 : 10;
+        return nice * power;
+      }
+      function escapeText(value) {
+        return String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+      }
+      function throughputPair(series, load) {
+        return `${interpolate(metricValues(series,'tps'), load).toFixed(0)}/${interpolate(metricValues(series,'userTps'), load).toFixed(1)} tok/s`;
+      }
+      function tooltipValue(series, metric, load) {
+        if (metric === 'tps' || metric === 'userTps') return throughputPair(series, load);
+        if (metric === 'tpot') return `${interpolate(metricValues(series,'tpot'), load).toFixed(0)} ms/token`;
+        return `avg ${interpolate(series.ttft, load).toFixed(0)} s · last ${interpolate(series.last, load).toFixed(0)} s`;
+      }
+
+      function renderLegend() {
+        legend.innerHTML = '';
+        data.forEach(series => {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.dataset.series = series.id;
+          button.setAttribute('aria-pressed', enabled.has(series.id) ? 'true' : 'false');
+          const outsideContext = contextFilter !== 'both' && String(series.context) !== contextFilter;
+          button.classList.toggle('context-muted', outsideContext);
+          button.innerHTML = `<span class="swatch" style="background:${series.color}"></span><span>${escapeText(series.short)} (${series.max} max)</span>`;
+          button.addEventListener('click', () => {
+            if (enabled.has(series.id) && enabled.size > 1) enabled.delete(series.id); else enabled.add(series.id);
+            renderAll();
+          });
+          legend.appendChild(button);
+        });
+      }
+
+      function renderChart(chart) {
+        const metric = chart.dataset.metric;
+        const config = chartConfig[metric];
+        const seriesList = visibleSeries();
+        const width = Math.max(300, Math.round(chart.getBoundingClientRect().width));
+        const height = width < 430 ? 255 : 285;
+        const margin = { top:18, right:14, bottom:45, left:58 };
+        const plotWidth = width - margin.left - margin.right;
+        const plotHeight = height - margin.top - margin.bottom;
+        const maxValue = Math.max(...seriesList.flatMap(s => metricValues(s,metric)), 1);
+        const yMax = niceMax(maxValue * 1.08);
+        const xScale = value => margin.left + (value / 100) * plotWidth;
+        const yScale = value => margin.top + plotHeight - (value / yMax) * plotHeight;
+        const xTicks = width < 430 ? [0,50,100] : loads;
+        const yTicks = Array.from({length:6}, (_,i) => yMax * i / 5);
+        const selectedX = xScale(selectedLoad);
+        const parts = [
+          `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeText(chart.parentElement.querySelector('.chart-title').textContent)} by admitted system load">`,
+          `<title>${escapeText(chart.parentElement.querySelector('.chart-title').textContent)}</title>`,
+          `<rect class="frame" x="${margin.left}" y="${margin.top}" width="${plotWidth}" height="${plotHeight}"></rect>`
+        ];
+        yTicks.forEach(value => {
+          const y = yScale(value);
+          parts.push(`<line class="grid-line" x1="${margin.left}" x2="${margin.left + plotWidth}" y1="${y}" y2="${y}"></line>`);
+          parts.push(`<text class="axis-text" x="${margin.left - 8}" y="${y + 4}" text-anchor="end">${value.toFixed(value < 10 && value % 1 ? 1 : 0)}</text>`);
+        });
+        xTicks.forEach(value => {
+          const x = xScale(value);
+          const label = value === 0 ? '1 user' : `${value}%`;
+          const anchor = value === 0 ? 'start' : value === 100 ? 'end' : 'middle';
+          parts.push(`<line class="axis-line" x1="${x}" x2="${x}" y1="${margin.top + plotHeight}" y2="${margin.top + plotHeight + 5}"></line>`);
+          parts.push(`<text class="axis-text" x="${x}" y="${height - 22}" text-anchor="${anchor}">${label}</text>`);
+        });
+        parts.push(`<text class="axis-title" x="${margin.left + plotWidth/2}" y="${height - 3}" text-anchor="middle">Admitted decode load</text>`);
+        parts.push(`<text class="axis-title" transform="translate(13 ${margin.top + plotHeight/2}) rotate(-90)" text-anchor="middle">${config.unit}</text>`);
+        if (metric === 'tpot') {
+          [50,100].filter(v => v <= yMax).forEach(v => {
+            const y = yScale(v);
+            parts.push(`<line x1="${margin.left}" x2="${margin.left + plotWidth}" y1="${y}" y2="${y}" stroke="var(--muted)" stroke-dasharray="4 4" opacity="0.65"></line>`);
+            parts.push(`<text class="threshold-label" x="${margin.left + plotWidth - 4}" y="${y - 4}" text-anchor="end">${v === 50 ? '20 tok/s' : '10 tok/s'}</text>`);
+          });
+        }
+        seriesList.forEach(series => {
+          const values = metricValues(series, metric);
+          const points = loads.map((load,i) => [xScale(load), yScale(values[i])]);
+          const path = points.map((point,i) => `${i === 0 ? 'M' : 'L'}${point[0].toFixed(2)},${point[1].toFixed(2)}`).join(' ');
+          parts.push(`<path class="series-line" d="${path}" stroke="${series.color}"></path>`);
+          points.forEach(point => parts.push(`<circle class="series-dot" cx="${point[0]}" cy="${point[1]}" r="3.5" fill="${series.color}"></circle>`));
+        });
+        parts.push(`<line class="selected-guide" x1="${selectedX}" x2="${selectedX}" y1="${margin.top}" y2="${margin.top + plotHeight}"></line>`);
+        parts.push(`<line class="hover-guide" x1="0" x2="0" y1="${margin.top}" y2="${margin.top + plotHeight}" visibility="hidden"></line>`);
+        parts.push(`<g class="hover-markers"></g>`);
+        parts.push(`<rect class="hit" x="${margin.left}" y="${margin.top}" width="${plotWidth}" height="${plotHeight}"></rect>`);
+        parts.push('</svg>');
+        chart.innerHTML = parts.join('');
+
+        const svg = chart.querySelector('svg');
+        const hit = chart.querySelector('.hit');
+        const guide = chart.querySelector('.hover-guide');
+        const markerGroup = chart.querySelector('.hover-markers');
+        const tooltip = chart.parentElement.querySelector('.tooltip');
+        function showTooltip(event) {
+          const rect = svg.getBoundingClientRect();
+          const px = Math.max(margin.left, Math.min(margin.left + plotWidth, (event.clientX - rect.left) * width / rect.width));
+          const load = Math.max(0, Math.min(100, (px - margin.left) / plotWidth * 100));
+          guide.setAttribute('x1', xScale(load));
+          guide.setAttribute('x2', xScale(load));
+          guide.setAttribute('visibility', 'visible');
+          markerGroup.innerHTML = seriesList.map(series => `<circle class="hover-marker" cx="${xScale(load)}" cy="${yScale(interpolate(metricValues(series,metric),load))}" r="4" fill="${series.color}"></circle>`).join('');
+          const title = load < 2 ? 'Single user' : `${load.toFixed(0)}% load`;
+          tooltip.innerHTML = `<div class="tooltip-title">${title}</div>` + seriesList.map(series => `<div class="tooltip-row"><span class="swatch" style="width:10px;background:${series.color}"></span><span>${escapeText(series.short)} · ${userCount(series,load)} users</span><span class="tooltip-value">${escapeText(tooltipValue(series,metric,load))}</span></div>`).join('');
+          tooltip.hidden = false;
+          const cardRect = chart.parentElement.getBoundingClientRect();
+          const tipRect = tooltip.getBoundingClientRect();
+          let left = event.clientX - cardRect.left + 12;
+          let top = event.clientY - cardRect.top - tipRect.height - 12;
+          left = Math.max(8, Math.min(cardRect.width - tipRect.width - 8, left));
+          top = Math.max(8, top);
+          tooltip.style.left = `${left}px`;
+          tooltip.style.top = `${top}px`;
+        }
+        hit.addEventListener('pointermove', showTooltip);
+        hit.addEventListener('pointerdown', showTooltip);
+        hit.addEventListener('pointerleave', () => {
+          guide.setAttribute('visibility', 'hidden');
+          markerGroup.innerHTML = '';
+          tooltip.hidden = true;
+        });
+      }
+
+      function renderScenario() {
+        const label = loadLabel(selectedLoad);
+        loadValue.textContent = label;
+        scenarioTitle.textContent = `Selected scenario: ${label}`;
+        scenarioBody.innerHTML = visibleSeries().map(series => {
+          const tpot = interpolate(metricValues(series,'tpot'), selectedLoad);
+          const avg = interpolate(series.ttft, selectedLoad);
+          const last = interpolate(series.last, selectedLoad);
+          const completion = avg + 0.511 * tpot;
+          return `<tr><td><span class="series-name"><span class="swatch" style="background:${series.color}"></span>${escapeText(series.short)}</span></td><td>${userCount(series,selectedLoad)}</td><td>${throughputPair(series,selectedLoad)}</td><td>${tpot.toFixed(1)} ms</td><td>${avg.toFixed(1)} s</td><td>${last.toFixed(1)} s</td><td>${completion.toFixed(1)} s</td></tr>`;
+        }).join('');
+      }
+
+      function renderCaseMath() {
+        if (typeof window.renderMathInElement !== 'function') return;
+        window.renderMathInElement(ui.mathBody, {
+          delimiters: [
+            { left: '\\[', right: '\\]', display: true },
+            { left: '\\(', right: '\\)', display: false }
+          ],
+          throwOnError: false,
+          strict: 'warn'
+        });
+      }
+
+      function modelGridForStorage(html) {
+        if (storageMode !== 'fp8') return html;
+        return html
+          .replaceAll('about 8.6/17.2 GiB', 'about 4.4/8.9 GiB')
+          .replaceAll('roughly 0.23/0.45 GiB', 'roughly 0.12/0.23 GiB')
+          .replaceAll('about 11.0/21.9 GiB', 'about 5.7/11.3 GiB')
+          .replaceAll('roughly 657 GiB', 'roughly 339 GiB')
+          .replaceAll('approximately 0.66/1.32 GiB', 'approximately 0.34/0.68 GiB')
+          .replaceAll('123/141 ms', '116/133 ms')
+          .replaceAll('240/276 ms', '231/268 ms')
+          .replaceAll('151/151 ms', '149/148 ms');
+      }
+
+      function viewHash() {
+        const timing = caseMode === 'fetch' ? 'fetch-at-decode' : 'token-ahead';
+        const storage = storageMode === 'fp8' ? 'fp8-kv' : 'bf16-kv';
+        return `#${timing}/${storage}`;
+      }
+
+      function applyCase(mode, updateHash = true) {
+        caseMode = mode === 'fetch' ? 'fetch' : 'ahead';
+        const copy = caseMode === 'fetch' ? fetchCase : aheadCase;
+        const isFp8 = storageMode === 'fp8';
+        document.title = isFp8 ? copy.documentTitle.replace('Estimate', 'FP8-KV Estimate') : copy.documentTitle;
+        document.documentElement.dataset.case = caseMode;
+        document.documentElement.dataset.storage = storageMode;
+        ui.eyebrow.textContent = copy.eyebrow;
+        ui.title.textContent = copy.title;
+        ui.hero.textContent = copy.hero;
+        ui.kvFormatChip.textContent = isFp8 ? 'FP8 KV storage → BF16 compute' : 'BF16 exact-KV storage';
+        ui.modeChip.textContent = copy.modeChip;
+        ui.reuseChip.hidden = caseMode !== 'fetch';
+        ui.statusChip.textContent = isFp8 ? 'Weight + KV dequant-aware, not benchmarked' : 'Weight-dequant aware, not benchmarked';
+        ui.fp8Summary.hidden = !isFp8;
+        ui.fp8Result.innerHTML = caseMode === 'ahead'
+          ? '<strong>Full-admission center:</strong> Kimi reaches 392/194 total tok/s at 128K/256K, GLM 271/224, and V4 Flash 525/446. Kimi and GLM include PP8 fill efficiency plus the FP8-KV overlay.'
+          : '<strong>Full-admission center:</strong> Kimi reaches 241/105 total tok/s at 128K/256K, GLM 173/112, and V4 Flash 431/325. Serialized selection and PP8 bubbles remain the dominant Case-B penalties.';
+        ui.summaryTitle.textContent = copy.summaryTitle;
+        ui.summaryGrid.innerHTML = copy.summaryGrid;
+        ui.assumptionsNote.textContent = copy.assumptionsNote;
+        ui.assumptionsList.innerHTML = copy.assumptionsList + (isFp8 ? '<li>Exact/offloaded KV and the selected GPU buffer use E4M3 storage plus per-128-value FP32 scales; values are fused-dequantized to FP16/BF16 for attention compute.</li>' : '');
+        ui.assumptionCallout.innerHTML = copy.assumptionCallout;
+        ui.modelGrid.innerHTML = modelGridForStorage(copy.modelGrid);
+        ui.explorerNote.innerHTML = copy.explorerNote + (isFp8 ? ' FP8 curves include an explicit Ampere dequantization penalty.' : '');
+        ui.aggregateSubtitle.textContent = copy.aggregateSubtitle;
+        ui.perUserSubtitle.textContent = copy.perUserSubtitle;
+        ui.mathSummary.innerHTML = copy.mathSummary + (isFp8 ? '<small>Includes the FP8 storage/dequantization overlay</small>' : '');
+        ui.mathBody.innerHTML = weightMath + (isFp8 ? fp8Math : '') + copy.mathBody;
+        ui.guidanceBody.innerHTML = copy.guidanceBody;
+        ui.limitsList.innerHTML = copy.limitsList + '<li><strong>Official-weight conversion uncertainty:</strong> A800 has no native FP8 tensor-core path. INT4/FP4/FP8 weights must be unpacked or converted for BF16 compute; an unfused implementation or persistent BF16 expansion would invalidate both performance and memory estimates.</li>' + (isFp8 ? '<li><strong>FP8-KV-on-Ampere uncertainty:</strong> a fused custom load/dequantize/attention path is assumed. An unfused KV conversion can erase the modeled cache-speed benefit.</li>' : '');
+        ui.footnote.textContent = copy.footnote + (isFp8 ? ' FP8 applies to KV storage only; model weights stay in each repository’s official native format.' : '');
+        document.querySelectorAll('[data-case]').forEach(button => {
+          button.setAttribute('aria-pressed', button.dataset.case === caseMode ? 'true' : 'false');
+        });
+        document.querySelectorAll('[data-storage]').forEach(button => {
+          button.setAttribute('aria-pressed', button.dataset.storage === storageMode ? 'true' : 'false');
+        });
+        if (updateHash) history.replaceState(null, '', viewHash());
+        renderAll();
+        if (document.readyState !== 'loading') requestAnimationFrame(renderCaseMath);
+      }
+
+      function renderAll() {
+        renderLegend();
+        document.querySelectorAll('.chart').forEach(renderChart);
+        renderScenario();
+      }
+
+      document.querySelectorAll('[data-context]').forEach(button => {
+        button.addEventListener('click', () => {
+          contextFilter = button.dataset.context;
+          document.querySelectorAll('[data-context]').forEach(item => item.setAttribute('aria-pressed', item === button ? 'true' : 'false'));
+          renderAll();
+        });
+      });
+      loadControl.addEventListener('input', () => {
+        selectedLoad = Number(loadControl.value);
+        renderAll();
+      });
+      document.querySelectorAll('[data-case]').forEach(button => {
+        button.addEventListener('click', () => {
+          if (button.dataset.case === caseMode) return;
+          applyCase(button.dataset.case);
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        });
+      });
+      document.querySelectorAll('[data-storage]').forEach(button => {
+        button.addEventListener('click', () => {
+          if (button.dataset.storage === storageMode) return;
+          storageMode = button.dataset.storage === 'fp8' ? 'fp8' : 'bf16';
+          applyCase(caseMode);
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        });
+      });
+      const resizeObserver = new ResizeObserver(() => document.querySelectorAll('.chart').forEach(renderChart));
+      document.querySelectorAll('.chart').forEach(chart => resizeObserver.observe(chart));
+      applyCase(caseMode, false);
+    })();
+  </script>
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      if (typeof window.renderMathInElement !== 'function') return;
+      window.renderMathInElement(document.getElementById('math-body'), {
+        delimiters: [
+          { left: '\\[', right: '\\]', display: true },
+          { left: '\\(', right: '\\)', display: false }
+        ],
+        throwOnError: false,
+        strict: 'warn'
+      });
+    });
+  </script>
+</body>
+</html>

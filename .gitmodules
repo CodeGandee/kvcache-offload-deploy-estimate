@@ -1,0 +1,21 @@
+[submodule "shadowkv"]
+	path = extern/tracked/shadowkv
+	url = https://github.com/ByteDance-Seed/ShadowKV.git
+[submodule "infersim"]
+	path = extern/tracked/infersim
+	url = https://github.com/alibaba/InferSim.git
+[submodule "glm-5"]
+	path = extern/tracked/glm-5
+	url = https://github.com/zai-org/GLM-5.git
+[submodule "transformers-glm53"]
+	path = extern/tracked/transformers-glm53
+	url = https://github.com/huggingface/transformers.git
+[submodule "kimi-k2.7-code"]
+	path = extern/tracked/kimi-k2.7-code
+	url = https://huggingface.co/moonshotai/Kimi-K2.7-Code
+[submodule "deepseek-v4-flash"]
+	path = extern/tracked/deepseek-v4-flash
+	url = https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash
+[submodule "llama-models"]
+	path = extern/tracked/llama-models
+	url = https://github.com/meta-llama/llama-models.git

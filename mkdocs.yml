@@ -1,0 +1,25 @@
+site_name: KV-cache Offload Deployment Estimates
+site_description: Reproducible planning estimates for KV-cache offloading deployments
+repo_url: https://github.com/CodeGandee/kvcache-offload-deploy-estimate
+repo_name: CodeGandee/kvcache-offload-deploy-estimate
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - content.code.copy
+nav:
+  - Home: index.md
+  - Approach: approach.md
+  - Cases:
+      - A800 PP8×TP2: cases/a800-pp8-tp2.md
+      - Interactive report: cases/a800-pp8-tp2-shadowkv.html
+  - Reproducibility: reproducibility.md
+  - References: references.md
+  - Data artifacts: data/README.md
+markdown_extensions:
+  - admonition
+  - attr_list
+  - pymdownx.arithmatex:
+      generic: true
+extra_javascript:
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
