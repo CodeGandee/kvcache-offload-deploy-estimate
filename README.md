@@ -14,6 +14,8 @@ four-GPU replicas on one server.
 
 ## Current result
 
+- [Live documentation](https://codegandee.github.io/kvcache-offload-deploy-estimate/)
+- [Live interactive report](https://codegandee.github.io/kvcache-offload-deploy-estimate/cases/a800-pp8-tp2-shadowkv.html)
 - [Case summary](docs/cases/a800-pp8-tp2.md)
 - [Interactive standalone report](docs/cases/a800-pp8-tp2-shadowkv.html)
 - [Estimation approach](docs/approach.md)

@@ -1,5 +1,6 @@
 site_name: KV-cache Offload Deployment Estimates
 site_description: Reproducible planning estimates for KV-cache offloading deployments
+site_url: https://codegandee.github.io/kvcache-offload-deploy-estimate/
 repo_url: https://github.com/CodeGandee/kvcache-offload-deploy-estimate
 repo_name: CodeGandee/kvcache-offload-deploy-estimate
 theme:
