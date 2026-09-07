@@ -61,12 +61,15 @@ class OraclePrefetch:
 
 @dataclass(frozen=True, slots=True)
 class A800Host:
-    """Usable, not nameplate, bandwidth assumptions for one 8×A800 server."""
+    """Usable bandwidth assumptions, using the A100 profile as an Ampere proxy."""
 
-    pcie_per_gpu_gbps: float = 25.0
+    hbm_stream_gbps: float = 1765.0
+    decode_gemm_mbu: float = 0.516
+    pcie_per_gpu_gbps: float = 22.0
+    pcie_tp2_pair_gbps: float = 25.4
     host_dram_gbps: float = 180.0
-    fp8_dequant_gbps: float = 360.0
-    nvlink_latency_ms: float = 0.006
+    fp8_dequant_gbps: float = 455.0
+    nvlink_latency_ms: float = 0.030
     ib_latency_ms: float = 0.012
     ib_payload_gbps: float = 40.0
 
@@ -371,8 +374,13 @@ def _transfer_time_ms(
     hardware: A800Host,
 ) -> float:
     per_gpu = stage_bytes_per_gpu * factor * users / (hardware.pcie_per_gpu_gbps * 1e9)
+    tp2_pair = (
+        stage_bytes_per_gpu * tp_size * factor * users / (hardware.pcie_tp2_pair_gbps * 1e9)
+        if tp_size == 2
+        else 0.0
+    )
     host = stage_bytes_per_gpu * tp_size * factor * users / (hardware.host_dram_gbps * 1e9)
-    return max(per_gpu, host) * 1000.0
+    return max(per_gpu, tp2_pair, host) * 1000.0
 
 
 def _estimate_once(
@@ -546,6 +554,7 @@ def _estimate_once(
     if prefetch_factor > 0.0:
         node_bytes = [0.0] * scenario.nodes
         per_gpu_times: list[float] = []
+        tp2_pair_times: list[float] = []
         for stage, (layers, resident, bytes_for_stage) in enumerate(
             zip(layer_counts, resident_counts, stage_bytes, strict=True)
         ):
@@ -553,6 +562,10 @@ def _estimate_once(
             moved = bytes_for_stage * (layers - resident) / layers * prefetch_factor * local_users
             node_bytes[node] += moved * scenario.tp_size
             per_gpu_times.append(moved / (hardware.pcie_per_gpu_gbps * 1e9) * 1000.0)
+            if scenario.tp_size == 2:
+                tp2_pair_times.append(
+                    moved * scenario.tp_size / (hardware.pcie_tp2_pair_gbps * 1e9) * 1000.0
+                )
             events.append(
                 TraceEvent(
                     stage=stage,
@@ -565,6 +578,7 @@ def _estimate_once(
             )
         background_service = max(
             max(per_gpu_times, default=0.0),
+            max(tp2_pair_times, default=0.0),
             max(
                 (value / (hardware.host_dram_gbps * 1e9) * 1000.0 for value in node_bytes),
                 default=0.0,
@@ -644,9 +658,10 @@ def estimate_point(
     samples: list[float] = []
     for _ in range(max(0, sensitivity_samples)):
         sample_hardware = A800Host(
-            pcie_per_gpu_gbps=rng.triangular(18.0, 29.0, hardware.pcie_per_gpu_gbps),
+            pcie_per_gpu_gbps=rng.triangular(20.5, 23.5, hardware.pcie_per_gpu_gbps),
+            pcie_tp2_pair_gbps=rng.triangular(23.0, 28.0, hardware.pcie_tp2_pair_gbps),
             host_dram_gbps=rng.triangular(130.0, 220.0, hardware.host_dram_gbps),
-            fp8_dequant_gbps=rng.triangular(240.0, 520.0, hardware.fp8_dequant_gbps),
+            fp8_dequant_gbps=rng.triangular(320.0, 520.0, hardware.fp8_dequant_gbps),
             nvlink_latency_ms=hardware.nvlink_latency_ms,
             ib_latency_ms=hardware.ib_latency_ms,
             ib_payload_gbps=hardware.ib_payload_gbps,
@@ -975,6 +990,16 @@ def build_report(
             "samples": sensitivity_samples,
             "interval": "p10-p90 parameter sensitivity; not a statistical confidence interval",
         },
+        "hardware_calibration": {
+            "source": "synthetic A100-SXM4-80GB GPUs 2+3; used as an Ampere proxy for A800",
+            "artifact": "benchmarks/a100-sxm4/results/a100-sxm4-80gb-gpu2-3.json",
+            "hbm_stream_gbps": DEFAULT_HARDWARE.hbm_stream_gbps,
+            "representative_bf16_gemm_mbu": DEFAULT_HARDWARE.decode_gemm_mbu,
+            "h2d_single_gpu_gbps": DEFAULT_HARDWARE.pcie_per_gpu_gbps,
+            "h2d_concurrent_tp2_pair_gbps": DEFAULT_HARDWARE.pcie_tp2_pair_gbps,
+            "fp8_dequant_gvalues_per_second": DEFAULT_HARDWARE.fp8_dequant_gbps,
+            "model_core_floor": "not replaced; no frontier-model kernels or weights were run",
+        },
         "series": series,
     }
 
@@ -1093,6 +1118,16 @@ def build_interactive_dataset(*, sensitivity_samples: int = 256) -> dict[str, An
             "hbmUtilization": 0.90,
             "runtimeReserveGiB": 6.0,
             "residentLayersAreBalancedAcrossStages": True,
+            "hardwareCalibration": {
+                "source": "synthetic A100-SXM4-80GB GPUs 2+3, used as an A800 proxy",
+                "artifact": "benchmarks/a100-sxm4/results/a100-sxm4-80gb-gpu2-3.json",
+                "hbmStreamGBps": DEFAULT_HARDWARE.hbm_stream_gbps,
+                "representativeBF16GemmMBU": DEFAULT_HARDWARE.decode_gemm_mbu,
+                "h2dSingleGPU_GBps": DEFAULT_HARDWARE.pcie_per_gpu_gbps,
+                "h2dConcurrentTP2Pair_GBps": DEFAULT_HARDWARE.pcie_tp2_pair_gbps,
+                "fp8DequantGvaluesPerSecond": DEFAULT_HARDWARE.fp8_dequant_gbps,
+                "modelCoreFloorReplaced": False,
+            },
         },
     }
 

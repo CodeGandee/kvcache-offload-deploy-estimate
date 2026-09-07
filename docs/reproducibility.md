@@ -15,6 +15,26 @@ pixi run check
 pixi run docs
 ```
 
+## A100 hardware-proxy calibration
+
+The synthetic calibration needs no model checkpoints and changes no system Python or
+CUDA packages. Copy `benchmarks/a100-sxm4/` to a local data disk on the target host,
+then run the locked project while exposing exactly the selected pair:
+
+```bash
+cd /path/on/local-data-disk/kvcache-offload-calibration-a100
+PIXI_CACHE_DIR=/path/on/local-data-disk/.cache/pixi \
+  CUDA_VISIBLE_DEVICES=2,3 \
+  numactl --cpunodebind=0 --membind=0 \
+  ~/.pixi/bin/pixi run calibrate
+```
+
+The checked-in [benchmark directory](https://github.com/CodeGandee/kvcache-offload-deploy-estimate/tree/main/benchmarks/a100-sxm4),
+custom CUDA FP8 conversion kernel, exact Pixi lock, and
+[public-safe raw result](https://github.com/CodeGandee/kvcache-offload-deploy-estimate/blob/main/benchmarks/a100-sxm4/results/a100-sxm4-80gb-gpu2-3.json)
+make the calibration reproducible. The JSON records hardware class and software
+versions but omits the private hostname and GPU UUIDs.
+
 Inspect pipeline calibration points:
 
 ```bash
@@ -76,8 +96,10 @@ LLMServingSim provides PP partitioning and serving-trace structure. Its checked-
 profiles do not cover these frontier models on A800, and stock tiered-KV offload does
 not express ShadowKV's landmark/reconstruction path. The extension therefore retains
 the earlier calibrated non-ShadowKV model-forward floor and explicitly simulates only
-the incremental ShadowKV events. Do not describe these values as native LLMServingSim
-predictions or measured A800 results.
+the incremental ShadowKV events. A100 measurements replace the PCIe, TP2-pair, FP8-KV
+conversion, and small P2P priors; they do not replace that frontier-model core floor.
+Do not describe the final values as native LLMServingSim predictions, full-model A100
+profiles, or measured A800 results.
 
 The load-indexed non-ShadowKV profile is also guarded by the one-user autoregressive
 latency floor for PP placements. This prevents an old capacity-oriented pipeline-fill

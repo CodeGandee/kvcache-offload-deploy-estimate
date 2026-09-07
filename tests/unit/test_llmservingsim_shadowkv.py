@@ -6,15 +6,41 @@ import pytest
 
 from kvcache_offload_deploy_estimate.llmservingsim_shadowkv import (
     SCENARIOS,
+    A800Host,
     OraclePrefetch,
     PolicyName,
     StorageName,
+    _transfer_time_ms,
     estimate_point,
     estimate_residency_scan,
     residency_scan,
     stage_layer_counts,
     stored_bytes_per_value,
 )
+
+
+def test_measured_tp2_pair_bandwidth_limits_concurrent_h2d() -> None:
+    hardware = A800Host()
+    elapsed = _transfer_time_ms(
+        stage_bytes_per_gpu=1e9,
+        factor=1.0,
+        users=1,
+        tp_size=2,
+        hardware=hardware,
+    )
+    assert elapsed == pytest.approx(2e12 / (25.4e9))
+
+
+def test_tp2_pair_measurement_is_not_assumed_for_tp4() -> None:
+    hardware = A800Host()
+    elapsed = _transfer_time_ms(
+        stage_bytes_per_gpu=1e9,
+        factor=1.0,
+        users=1,
+        tp_size=4,
+        hardware=hardware,
+    )
+    assert elapsed == pytest.approx(1e12 / (22.0e9))
 
 
 def test_oracle_separates_recall_from_precision() -> None:

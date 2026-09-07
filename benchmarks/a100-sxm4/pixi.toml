@@ -1,0 +1,14 @@
+[workspace]
+name = "kvcache-offload-a100-calibration"
+channels = ["conda-forge"]
+platforms = [{ platform = "linux-64", cuda = "12.9" }]
+
+[dependencies]
+python = "3.12.*"
+cuda-version = "12.9.*"
+cuda-nvcc = "12.9.*"
+pytorch = { version = "==2.9.1", build = "cuda129_mkl*" }
+
+[tasks]
+calibrate = "nvcc -O3 --std=c++17 -arch=sm_80 dequant_bench.cu -o dequant_bench && python calibrate.py --output results/a100-sxm4-80gb-gpu2-3.json"
+summary = "python summarize.py results/a100-sxm4-80gb-gpu2-3.json"

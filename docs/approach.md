@@ -6,8 +6,11 @@ Checkpoint byte totals come from the official Hugging Face repositories. Hardwar
 capacities and link rates come from vendor documentation. ShadowKV selector timing
 and reconstruction/fetch ordering come from the paper and its implementation.
 
-Everything else—kernel fusion efficiency, pipeline balance, overlap, and final
-throughput—is explicitly treated as a model assumption rather than a measurement.
+Synthetic A100-SXM4 measurements now ground HBM streaming, single- and dual-GPU
+host transfer, small/large peer copy, representative BF16 GEMM efficiency, and a
+custom fused FP8-KV conversion kernel. They are used only as an Ampere proxy for
+the A800 link and conversion terms. Frontier-model kernel fusion, pipeline balance,
+overlap, the non-ShadowKV model-core floor, and final throughput remain modeled.
 
 ## 2. Place official checkpoint formats
 
@@ -40,6 +43,11 @@ PP8×TP2 and PP2×TP8 have the same balanced per-GPU weight and cache share:
 
 Only the stage-4→5 BF16 activation crosses the 400 Gb/s InfiniBand link. Six other
 pipeline boundaries remain inside the two servers on NVLink.
+
+Within one TP2 stage, both GPUs share a measured host-transfer service center. The
+model therefore caps simultaneous traffic at 25.4 GB/s for the pair rather than
+granting each GPU its approximately 22 GB/s single-transfer result. Other TP2 pairs are assumed
+to have independent PCIe paths until the node-wide 180 GB/s host-DRAM ceiling.
 
 ## 4. Compute the sparse working set
 
@@ -178,19 +186,47 @@ q_{\mathrm{bytes}}=\frac{1+4/128}{2}=0.515625
 
 relative to BF16 KV. The extension does not apply a blanket effective multiplier.
 It scales stored-byte transfer by 0.515625, adds explicit dequantization at a central
-360 Gvalue/s, and leaves low-rank reconstruction plus attention in BF16. The
-sensitivity run samples 240–520 Gvalue/s. This makes FP8 gains small whenever key
+455 Gvalue/s, and leaves low-rank reconstruction plus attention in BF16. The
+sensitivity run samples 320–520 Gvalue/s. This makes FP8 gains small whenever key
 reconstruction is the critical materialization branch.
 
-## 8. Parameter sensitivity, not confidence
+## 8. Calibrate hardware primitives on A100
+
+The public synthetic run used physical GPUs 2 and 3 on one 8×A100-SXM4-80GB host,
+with CPU and memory bound to their NUMA node. It used a locked Pixi environment on
+local NVMe and downloaded no model weights.
+
+| Primitive | Measured center | How it is used |
+|---|---:|---|
+| SM streaming HBM | 1,765 GB/s | Roofline sanity check; 86.6% of 2,039 GB/s nameplate |
+| H2D, one GPU, long transfer | 22.0 GB/s | Per-GPU transfer ceiling |
+| H2D, both TP2 GPUs concurrently | 25.4 GB/s aggregate | Shared TP2-pair transfer ceiling; about 12.7 GB/s/GPU |
+| P2P, 4 KiB | 0.031 ms | Conservative small-handoff launch/synchronization proxy |
+| P2P, 256 MiB | 274 GB/s | Large-copy topology check |
+| Fused E4M3 block-128 → BF16 | 455 Gvalue/s | FP8-KV dequantization center |
+| Representative BF16 GEMM MBU | 51.6% median, 30.7–61.8% range | Kernel-level plausibility check only |
+
+The custom fused dequant kernel sustained about 1.38 TB/s of useful input, scale,
+and output traffic. A separate PyTorch cast-plus-scale path reached only about
+80 Gvalue/s, so fusion is a necessary condition for the central FP8 result.
+
+The 51.6% GEMM MBU is not substituted for end-to-end model MBU. It excludes MoE
+routing, collectives, attention, pipeline bubbles, launch gaps, and official
+FP8/INT4/FP4 weight-unpack kernels. Replacing the model-core floor requires those
+operators or a full-model decode profile; the current run calibrates only the
+incremental offload/conversion path. The exact script, Pixi lock, CUDA kernel, and
+raw JSON are under `benchmarks/a100-sxm4/`.
+
+## 9. Parameter sensitivity, not confidence
 
 Each displayed center has a reproducible 256-sample sensitivity study. It varies
-usable PCIe bandwidth (18–29 GB/s), node host-DRAM bandwidth (130–220 GB/s), FP8
-dequantization (240–520 Gvalue/s), selector timing (20% log-normal spread), and
-materialization timing (25% spread). The resulting p10–p90 range is not a confidence
-interval: it omits architecture mismatch and unknown A800 frontier-model profiles.
+single-GPU PCIe bandwidth (20.5–23.5 GB/s), concurrent TP2-pair bandwidth
+(23–28 GB/s aggregate), node host-DRAM bandwidth (130–220 GB/s), FP8 dequantization
+(320–520 Gvalue/s), selector timing (20% log-normal spread), and materialization
+timing (25% spread). The resulting p10–p90 range is not a confidence interval: it
+omits A100→A800 topology mismatch and unknown frontier-model operator profiles.
 
-## 9. Separate prefill TTFT from decode TPOT
+## 10. Separate prefill TTFT from decode TPOT
 
 Long prompts are split into 4K-token chunks. A 72K, 128K, or 256K prompt supplies
 roughly 18, 32, or 64 pipeline microbatches, giving PP8 fill efficiencies of
@@ -209,7 +245,7 @@ For a simultaneous cold burst scheduled first-token-first,
 At sustained offered utilization \(\rho\to1\), queue delay is unbounded. The report's
 100% point is a finite closed batch, not a stable production operating target.
 
-## 10. Add native MTP as a separate decode overlay
+## 11. Add native MTP as a separate decode overlay
 
 The model-fixed NextN layer count is not used as the speculative block length. The
 serving overlay uses the documented deployment starting points: \(k=3\) draft tokens
@@ -243,7 +279,7 @@ covers only the first target position; deeper positions pay fetch-at-decode sele
 and miss work. The separate MTP plots therefore do not imply a generic
 \((A+1)\)-times speedup.
 
-## 11. Quantize partial HBM residency to whole layers
+## 12. Quantize partial HBM residency to whole layers
 
 For a requested exact-KV HBM ratio \(p\), the implementation can retain only an
 integer number of cache-bearing layers:
