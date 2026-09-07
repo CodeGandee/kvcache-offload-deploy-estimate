@@ -240,9 +240,9 @@
     </nav>
   </div>
   <header class="hero page">
-    <p class="eyebrow" id="case-eyebrow">Case A · optimistic token-ahead prefetch</p>
+    <p class="eyebrow" id="case-eyebrow">Case A · oracle-assisted token-ahead prefetch</p>
     <h1 id="case-title">ShadowKV with one-token-ahead prediction</h1>
-    <p class="hero-copy" id="case-hero-copy">An ideal-case estimate of raw TTFT, TPOT, output throughput, and simultaneous-user capacity when official Hugging Face weight formats are dequantized for BF16 compute. Kimi and GLM span two IB-connected 8×A800 nodes; V4 Flash uses one node.</p>
+    <p class="hero-copy" id="case-hero-copy">A ShadowKV trace extension for LLMServingSim, estimating raw TTFT, TPOT, output throughput, and simultaneous-user capacity. The non-ShadowKV forward path remains calibrated rather than measured; landmark selection, sparse miss materialization, PCIe/DRAM contention, and FP8 conversion are explicit per-transformer-block events.</p>
     <div class="scope-line" aria-label="Study scope">
       <span class="chip">1–2 nodes · 8×A800 80 GB each</span>
       <span class="chip">Kimi/GLM · PP8×TP2</span>
@@ -250,9 +250,9 @@
       <span class="chip">Official HF weights → BF16 compute</span>
       <span class="chip">1.56% KV selection</span>
       <span class="chip" id="kv-format-chip">BF16 exact-KV storage</span>
-      <span class="chip" id="case-mode-chip">80% token-ahead prefetch hit</span>
-      <span class="chip" id="case-reuse-chip" hidden>60% temporal-cache reuse</span>
-      <span class="chip status-chip" id="case-status-chip">Modeled, not benchmarked</span>
+      <span class="chip" id="case-mode-chip">Oracle: 80% recall / 80% precision</span>
+      <span class="chip" id="case-reuse-chip">60% temporal-cache reuse</span>
+      <span class="chip status-chip" id="case-status-chip">LLMServingSim extension · not benchmarked</span>
     </div>
   </header>
 
@@ -296,7 +296,7 @@
         <article class="card summary-card">
           <span class="kicker">A800 caveat</span>
           <strong>Conversion is not free</strong>
-          <p>A800 is Ampere SM80, without Hopper's native FP8 conversion path. The estimate charges fused dequantization and uses an effective cache-path factor of 0.72, not the byte-only 0.516.</p>
+          <p>A800 is Ampere SM80, without Hopper's native FP8 conversion path. The trace charges explicit conversion at a 360 GB/s central effective rate and samples 240–520 GB/s in sensitivity runs.</p>
         </article>
         <article class="card summary-card">
           <span class="kicker">Admission</span>
@@ -333,14 +333,14 @@
     <section aria-labelledby="assumptions-title">
       <div class="section-head">
         <h2 id="assumptions-title">Assumptions</h2>
-        <p class="section-note" id="assumptions-note">“Perfect condition” means flawless execution of the stated design—not a 100% predictor hit rate. The previously specified 80% hit rate remains in force.</p>
+        <p class="section-note" id="assumptions-note">“Perfect condition” means flawless execution of the stated design—not a magical oracle. The central advisory oracle has 80% recall and 80% precision and is verified by current-token landmark selection.</p>
       </div>
       <div class="assumption-grid">
         <article class="card assumption-card">
           <h3>Hardware and runtime</h3>
           <ul>
             <li>Each node has 8× NVIDIA A800 80 GB, approximately 640 GB nominal aggregate HBM; Kimi and GLM consume two IB-connected nodes, while V4 Flash consumes one.</li>
-            <li>Approximately 31.5 GB/s usable one-way PCIe Gen4 bandwidth per GPU and sufficient CPU DRAM/NUMA bandwidth.</li>
+            <li>25 GB/s central usable one-way PCIe Gen4 bandwidth per GPU and 180 GB/s aggregate host-DRAM bandwidth per node; the sensitivity run samples 18–29 GB/s and 130–220 GB/s respectively.</li>
             <li>400 Gb/s InfiniBand is modeled as approximately 40 GB/s usable one-way payload bandwidth. Stages 1–4 are on server A and 5–8 on server B, so pipeline parallelism crosses IB once per forward pass.</li>
             <li>1 TB system RAM per node, with exact caches sharded across GPU-local NUMA regions rather than replicated for every tensor-parallel rank.</li>
             <li>Custom serving code, optimized kernels, static knowledge of all requests, and one model deployment at a time.</li>
@@ -351,13 +351,14 @@
           <ul id="model-assumptions-list">
             <li>Official Hugging Face storage formats are retained: Kimi native INT4, GLM FP8, and V4 Flash mixed FP4/FP8. Fused kernels dequantize into registers/shared memory and compute in BF16; no persistent BF16 weight copy is allocated.</li>
             <li>Exactly 1.56% of context entries are selected: 2,048 at 128K and 4,096 at 256K.</li>
-            <li>One-token-ahead prefetch is 80% correct; 20% of required entries arrive just in time. Wrong prefetches make total transfer approximately 1.2× the useful selected set.</li>
-            <li>Prediction, indexing, reconstruction, communication, and correct prefetch transfers overlap with useful GPU work whenever causally possible.</li>
+            <li>Temporal reuse retains 60% of the selected set. Over the remaining 40%, the one-token-ahead oracle has 80% recall and 80% precision: it prefetches 0.40× the selected set and leaves 0.08× for just-in-time materialization.</li>
+            <li>The current query still runs landmark selection to verify the required set and discover oracle misses. Only prefetch and reconstruction that finish before their consumer are hidden.</li>
+            <li>Every cache-bearing transformer block is charged separately, following ShadowKV Table 13's causal order: select → max(reconstruct K, fetch V) → sparse attention.</li>
             <li>No quality degradation from sparse selection and no pathological attention pattern that defeats the predictor.</li>
           </ul>
         </article>
       </div>
-      <div class="callout" id="assumption-callout"><strong>Critical dependency:</strong> Kimi and GLM are modeled as PP8×TP2, with four contiguous stages per server—not cross-node expert parallel. Their layer groups, exact cache, and shadow representation are stage-local. The central decode curve uses one request per pipeline microbatch; coarser microbatches would leave more bubbles and reduce throughput.</div>
+      <div class="callout" id="assumption-callout"><strong>Simulation boundary:</strong> the pinned LLMServingSim code supplies its vLLM-compatible transformer-block partitioning: Kimi's 61 cache blocks split 7/7/8/8/8/8/8/7 and GLM's 78 split 9/10/10/10/10/10/10/9. This repository adds ShadowKV events externally because stock tiered-KV recall does not represent landmark selection or low-rank key reconstruction.</div>
     </section>
 
     <section aria-labelledby="models-title">
@@ -369,21 +370,21 @@
         <article class="card model-card">
           <span class="kicker">Kimi Code 2.7</span>
           <h3>Largest decode-side upside</h3>
-          <p>Its dense MLA-style long-context attention still pays heavily for cache access. The 595.2 GB native-INT4 checkpoint is too tight for a practical one-node runtime, so PP8×TP2 adds aggregate pipeline capacity once enough requests are in flight.</p>
+          <p>Its dense MLA-style long-context attention still pays heavily for cache access. The 595.2 GB native-INT4 checkpoint is too tight for a practical one-node runtime. The 80/80 oracle helps, but current-token landmark verification leaves full-load FP8 centers at 6.8/6.5 tok/s per user for 128K/256K.</p>
           <p><strong>Planning cache:</strong> about 8.6/17.2 GiB exact CPU cache per 128K/256K request. With one eighth of the layers on each TP2 stage, the sharded GPU representation remains roughly 0.23/0.45 GiB per request per GPU.</p>
           <div class="maxima"><div><span>128K admitted max</span><strong>28 users</strong></div><div><span>256K admitted max</span><strong>14 users</strong></div></div>
         </article>
         <article class="card model-card">
           <span class="kicker">GLM-5.3</span>
           <h3>Capacity gain more than TPOT gain</h3>
-          <p>GLM already uses a sparse attention indexer. Its 755.6 GB FP8 checkpoint requires two nodes; PP8×TP2 assigns an approximately equal contiguous layer group to each two-GPU stage. Selector state stays in HBM and exact latent cache stays in that stage's node-local RAM.</p>
+          <p>GLM already uses a sparse attention indexer. Its 755.6 GB FP8 checkpoint requires two nodes; PP8×TP2 assigns an approximately equal contiguous layer group to each two-GPU stage. Reusing ShadowKV's Llama selector timing across 78 blocks is costly: full-load FP8 centers are 3.8/3.3 tok/s per user.</p>
           <p><strong>Planning cache:</strong> about 11.0/21.9 GiB exact CPU cache per request. At 256K, 30 users consume roughly 657 GiB, split across the two node-local host-memory pools.</p>
           <div class="maxima"><div><span>128K admitted max</span><strong>40 users</strong></div><div><span>256K admitted max</span><strong>30 users</strong></div></div>
         </article>
         <article class="card model-card">
           <span class="kicker">DeepSeek V4 Flash</span>
           <h3>Least incremental ShadowKV benefit</h3>
-          <p>Its native compressed/sparse cache is already small. The high modeled throughput mainly comes from lower active compute and the assumption that two four-GPU replicas fit—not from a dramatic ShadowKV speedup.</p>
+          <p>Its native compressed/sparse cache is already small. Two four-GPU replicas still give the highest aggregate rate, but per-block verification lowers full-load FP8 centers to 6.6/6.7 tok/s per user. ShadowKV itself adds little over the trained cache design.</p>
           <p><strong>Planning cache:</strong> offload only the larger ratio-4 portion, approximately 0.66/1.32 GiB per request. Preserve the trained compression and treat 1.56% as a cap where forcing more entries would be wasteful.</p>
           <div class="maxima"><div><span>128K admitted max</span><strong>64 users</strong></div><div><span>256K admitted max</span><strong>48 users</strong></div></div>
         </article>
@@ -503,14 +504,14 @@
             B_{\mathrm{sel,stage}}(N)=\frac{S(N)\,(L/P)\,d_c\,b}{G_s}.
           \]
 
-          <h3>2. Prefetch accuracy and PCIe traffic</h3>
-          <p>Let \(h=0.8\) be the one-token-ahead prefetch hit rate. The predictor fetches one set of \(S\) entries. Of those, \(hS\) are useful and \((1-h)S\) are false positives; another \((1-h)S\) required entries arrive just in time. Therefore</p>
+          <h3>2. Oracle recall, precision, reuse, and PCIe traffic</h3>
+          <p>Let \(r=0.60\) be temporal reuse from the preceding token, \(R_o=0.80\) oracle recall, and \(P_o=0.80\) oracle precision, all measured over entries not already resident. This separates useful coverage from false-positive traffic:</p>
           \[
-            B_{\mathrm{total}}=(2-h)B_{\mathrm{sel}}=1.2B_{\mathrm{sel}},
+            B_{\mathrm{prefetch}}=(1-r)\frac{R_o}{P_o}B_{\mathrm{sel}}=0.40B_{\mathrm{sel}},
             \qquad
-            B_{\mathrm{JIT}}=(1-h)B_{\mathrm{sel}}=0.2B_{\mathrm{sel}}.
+            B_{\mathrm{JIT}}=(1-r)(1-R_o)B_{\mathrm{sel}}=0.08B_{\mathrm{sel}}.
           \]
-          <p>In the ideal overlap case, total traffic determines sustainable throughput, but only \(B_{\mathrm{JIT}}\) is necessarily exposed on the critical path. With per-GPU usable PCIe bandwidth \(\beta_{\mathrm{PCIe}}\approx31.5\ \mathrm{GB/s}\), the irreducible miss penalty is approximated by</p>
+          <p>The total newly materialized traffic is 0.48× the selected set, versus 0.40× for fetch-at-decode with the same reuse. Prefetch is allowed to overlap the preceding token, but the selector and the 0.08× just-in-time miss set remain on the current token's critical path. With central per-GPU usable PCIe bandwidth \(\beta_{\mathrm{PCIe}}=25\ \mathrm{GB/s}\),</p>
           \[
             t_{\mathrm{JIT}}\approx\frac{B_{\mathrm{JIT}}}{\beta_{\mathrm{PCIe}}}.
           \]
@@ -524,7 +525,7 @@
               </tbody>
             </table>
           </div>
-          <p class="math-note">These small miss-only times do not prove the transfers are free. At high batch size, \(1.2B_{\mathrm{sel}}\) for every active sequence competes for PCIe and CPU-memory bandwidth. The estimate requires NUMA-local cache shards and full overlap of the predicted 80%.</p>
+          <p class="math-note">A perfect authoritative oracle would use \(R_o=P_o=1\) and could make verification optional. This page is stricter: the 80/80 oracle is advisory, so landmark selection still executes to preserve accuracy.</p>
 
           <h3>3. Memory and admission capacity</h3>
           <p>For admitted concurrency \(C\), the simplified per-node HBM and host-memory constraints are</p>
@@ -557,16 +558,17 @@
             <p>Kimi: \(C_{\max}=28/14\), GLM: \(C_{\max}=40/30\), and V4 Flash: \(C_{\max}=64/48\) for 128K/256K respectively. These are throughput/latency admission knees, not the largest values that fit in memory.</p>
           </div>
 
-          <h3>4. Decode-time roofline and throughput</h3>
-          <p>For active batch \(C\), decode step time is modeled as the slowest relevant resource path plus non-overlapped coordination:</p>
+          <h3>4. LLMServingSim trace extension and throughput</h3>
+          <p>The extension follows LLMServingSim's trace structure and imports its transformer-block PP partitioner for stage ownership. Because upstream has no A800 profiles for these frontier models, the non-ShadowKV floor \(T_{\mathrm{core}}\) remains a calibrated input rather than an upstream prediction. For every cache-bearing block \(\ell\), the extension emits selection, background prefetch, miss materialization, and optional FP8 dequant events. The causal critical path is</p>
           \[
-            T_{\mathrm{step}}(C,N)\approx
-            \max\!\left[
-              \frac{F_{\mathrm{token}}(C)}{P_{\mathrm{eff}}},
-              \frac{B_{\mathrm{HBM}}(C,N)}{\beta_{\mathrm{HBM,eff}}},
-              \frac{B_{\mathrm{PCIe}}(C,N)}{\beta_{\mathrm{PCIe,eff}}}
-            \right]
-            + t_{\mathrm{collective}}.
+            t_{\ell}=t_{\mathrm{select},\ell}
+            +\max(t_{K,\ell},t_{V,\ell}+t_{\mathrm{dequant},\ell})
+            +t_{\mathrm{attention},\ell},
+          \]
+          \[
+            T_{\mathrm{step}}=T_{\mathrm{core}}
+            +\sum_{\ell=1}^{L}\!\left[t_{\mathrm{select},\ell}+t_{\mathrm{materialize},\ell}\right]
+            +\max(0,t_{\mathrm{prefetch}}-t_{\mathrm{overlap}})+t_{\mathrm{PP/IB}}.
           \]
           <p>The total and fair-share output rates then follow directly:</p>
           \[
@@ -576,7 +578,7 @@
             \qquad
             \mathrm{TPOT}=\frac{1000}{Y_{\mathrm{user}}}\ \mathrm{ms}.
           \]
-          <p>The report does not claim exact values for \(P_{\mathrm{eff}}\), \(\beta_{\mathrm{HBM,eff}}\), or collective efficiency without an A800 measurement. Instead, it uses architecture-informed center points at one user and 25/50/75/100% of \(C_{\max}\). This is why the resulting throughput/TPOT curves carry approximately ±30–50% uncertainty.</p>
+          <p>ShadowKV Table 13 reports per-transformer-block selection of 0.80 ms and materialization \(\max(1.36,1.66)=1.66\) ms at 24×128K. These terms are scaled by active sequences, context, cached width, reuse, and storage precision. Unlike the earlier page revision, materialization is multiplied by every cache-bearing block. A deterministic 256-sample sensitivity run varies PCIe, host DRAM, dequant throughput, selector timing, and materialization timing; its p10–p90 range is a parameter-sensitivity interval, not a confidence interval.</p>
 
           <h3>5. Model-specific calibration logic</h3>
           <div class="math-step">
@@ -632,9 +634,9 @@
         <table class="guidance-table">
           <thead><tr><th>Candidate</th><th>Suggested active decoders</th><th>Expected experience after prefill</th><th>Main risk</th></tr></thead>
           <tbody id="guidance-body">
-            <tr><td>Kimi Code 2.7 · 128K / 256K</td><td>14–21 / 7–11</td><td><span class="good">Acceptable</span>, roughly 11–16 tok/s</td><td>PP8 bubbles below this range and dense long-prompt prefill</td></tr>
-            <tr><td>GLM-5.3 · 128K / 256K</td><td>10–20 / 8–15</td><td><span class="warn">Slow</span>, roughly 7–8 tok/s</td><td>FP8 weight conversion on SM80 and PP8 stage balance</td></tr>
-            <tr><td>DeepSeek V4 Flash · 128K / 256K</td><td>≤32 / ≤24 across two replicas</td><td><span class="warn">Acceptable</span>, roughly 13–15 tok/s</td><td>ShadowKV adds little over the native compressed cache</td></tr>
+            <tr><td>Kimi Code 2.7 · 128K / 256K</td><td>7–14 / 4–7</td><td><span class="warn">Slow to acceptable</span>, roughly 7–9 tok/s</td><td>Verified selection remains serialized despite oracle prefetch</td></tr>
+            <tr><td>GLM-5.3 · 128K / 256K</td><td>10–20 / 8–15</td><td><span class="warn">Slow</span>, roughly 4–6 tok/s</td><td>78 extrapolated ShadowKV selectors plus FP8 weight conversion</td></tr>
+            <tr><td>DeepSeek V4 Flash · 128K / 256K</td><td>≤32 / ≤24 across two replicas</td><td><span class="warn">Acceptable</span>, roughly 10–15 tok/s</td><td>ShadowKV adds little over the native compressed cache</td></tr>
           </tbody>
         </table>
       </div>
@@ -646,7 +648,7 @@
       </div>
       <article class="card">
         <ul class="limits-list" id="limits-list">
-          <li><strong>Not an A800 benchmark:</strong> aggregate throughput and TPOT should be treated as planning centers with approximately ±30–50% uncertainty; cold TTFT may vary by at least ±50%.</li>
+          <li><strong>Not an A800 benchmark:</strong> the simulator's p10–p90 band varies five explicit timing/bandwidth inputs, but it does not cover architecture error. Frontier-model operator profiles and cold TTFT can still be wrong by at least ±50%.</li>
           <li><strong>Steady decode and cold prefill are separated:</strong> the decode graphs assume requests have completed prefill. Mixing new 128K/256K prefills into a full decode batch will cause TPOT spikes unless capacity is reserved.</li>
           <li><strong>Checkpoint bytes are measured, runtime bytes are modeled:</strong> official safetensor totals are 595.2 GB for Kimi, 755.6 GB for GLM, and 159.6 GB for V4 Flash. Allocator alignment, duplicated metadata, kernels, and communication workspaces can raise HBM use.</li>
           <li><strong>Pipeline topology is assumed:</strong> Kimi and GLM use PP8×TP2, with stages 1–4 on one node and 5–8 on the other. The central curve uses one independently schedulable request per decode microbatch; larger microbatches increase bubbles.</li>
@@ -658,7 +660,7 @@
       </article>
     </section>
 
-    <p class="footnote" id="case-footnote">This page covers only Case A: one-token-ahead prediction with an 80% prefetch hit rate. Official Hugging Face checkpoint formats are dequantized for BF16 compute; Kimi and GLM use two-node PP8×TP2 with four contiguous stages per node, while V4 Flash uses two four-GPU replicas on one node. Scope intentionally excludes DeepSeek V4 Pro.</p>
+    <p class="footnote" id="case-footnote">Case A uses an advisory one-token-ahead oracle with 80% recall and 80% precision over the 40% miss set left after temporal reuse. Current-token landmark verification remains on the critical path. The figures come from a ShadowKV event extension around pinned LLMServingSim commit a4053bc; the frontier-model operator floor is calibrated, not measured on A800.</p>
   </main>
 
   <script>
@@ -667,13 +669,21 @@
       let caseMode = location.hash.includes('fetch-at-decode') ? 'fetch' : 'ahead';
       let storageMode = location.hash.includes('fp8-kv') ? 'fp8' : 'bf16';
       const data = [
-        { id:'kimi-128', name:'Kimi Code 2.7', short:'Kimi 128K', context:128, max:28, color:'var(--s1)', tps:[6,95,211,295,353], userTps:[6.00,13.57,15.07,14.05,12.61], tpot:[166.7,73.7,66.4,71.2,79.3], fetch:{tps:[5,68,144,193,227], userTps:[5.00,9.71,10.29,9.19,8.11], tpot:[200.0,103.0,97.2,108.8,123.3]}, fp8:{ahead:{tps:[6,101,228,324,392], userTps:[6.00,14.43,16.29,15.43,14.00], tpot:[166.7,69.3,61.4,64.8,71.4]}, fetch:{tps:[5,71,150,205,241], userTps:[5.00,10.14,10.71,9.76,8.61], tpot:[200.0,98.6,93.4,102.5,116.1]}}, ttft:[16.6,66.4,124.5,182.6,240.7], last:[16.6,116.2,232.4,348.6,464.8] },
-        { id:'kimi-256', name:'Kimi Code 2.7', short:'Kimi 256K', context:256, max:14, color:'var(--s2)', tps:[5,30,77,129,171], userTps:[5.00,7.50,11.00,11.73,12.21], tpot:[200.0,133.3,90.9,85.3,81.9], fetch:{tps:[4,21,49,78,99], userTps:[4.00,5.25,7.00,7.09,7.07], tpot:[250.0,190.5,142.9,141.0,141.4]}, fp8:{ahead:{tps:[5,33,84,146,194], userTps:[5.00,8.25,12.00,13.27,13.86], tpot:[200.0,121.2,83.3,75.4,72.2]}, fetch:{tps:[4,22,51,83,105], userTps:[4.00,5.50,7.29,7.55,7.50], tpot:[250.0,181.8,137.2,132.5,133.3]}}, ttft:[43.2,108.0,172.8,259.2,324.0], last:[43.2,172.8,302.4,475.2,604.8] },
-        { id:'glm-128', name:'GLM-5.3', short:'GLM 128K', context:128, max:40, color:'var(--s3)', tps:[3,77,157,216,260], userTps:[3.00,7.70,7.85,7.20,6.50], tpot:[333.3,129.9,127.4,138.9,153.8], fetch:{tps:[2,57,108,143,167], userTps:[2.00,5.70,5.40,4.77,4.17], tpot:[500.0,175.4,185.2,209.6,239.8]}, fp8:{ahead:{tps:[3,78,163,224,271], userTps:[3.00,7.80,8.15,7.47,6.78], tpot:[333.3,128.2,122.7,133.9,147.5]}, fetch:{tps:[2,58,111,148,173], userTps:[2.00,5.80,5.55,4.93,4.33], tpot:[500.0,172.4,180.2,202.8,230.9]}}, ttft:[14.3,78.7,150.2,221.7,293.2], last:[14.3,143.0,286.0,429.0,572.0] },
-        { id:'glm-256', name:'GLM-5.3', short:'GLM 256K', context:256, max:30, color:'var(--s4)', tps:[2,56,121,176,211], userTps:[2.00,7.00,8.07,7.65,7.03], tpot:[500.0,142.9,123.9,130.7,142.2], fetch:{tps:[2,37,70,95,109], userTps:[2.00,4.63,4.67,4.13,3.63], tpot:[500.0,216.0,214.1,242.1,275.5]}, fp8:{ahead:{tps:[2,59,126,185,224], userTps:[2.00,7.38,8.40,8.04,7.47], tpot:[500.0,135.5,119.0,124.4,133.9]}, fetch:{tps:[2,38,73,98,112], userTps:[2.00,4.75,4.87,4.26,3.73], tpot:[500.0,210.5,205.3,234.7,268.1]}}, ttft:[28.7,129.2,229.6,344.4,444.9], last:[28.7,229.6,430.5,660.1,861.0] },
-        { id:'flash-128', name:'DeepSeek V4 Flash', short:'V4 Flash 128K', context:128, max:64, color:'var(--s5)', tps:[41,282,403,475,514], userTps:[41,17.63,12.59,9.90,8.03], tpot:[24.4,56.7,79.4,101.0,124.5], fetch:{tps:[35,243,340,394,423], userTps:[35,15.19,10.63,8.21,6.61], tpot:[28.6,65.8,94.1,121.8,151.3]}, fp8:{ahead:{tps:[41,286,409,483,525], userTps:[41,17.88,12.78,10.06,8.20], tpot:[24.4,55.9,78.2,99.4,122.0]}, fetch:{tps:[35,245,343,400,431], userTps:[35,15.31,10.72,8.33,6.73], tpot:[28.6,65.3,93.3,120.0,148.6]}}, ttft:[7.3,32.8,61.9,91.0,120.1], last:[7.3,58.2,116.5,174.7,232.9] },
-        { id:'flash-256', name:'DeepSeek V4 Flash', short:'V4 Flash 256K', context:256, max:48, color:'var(--s6)', tps:[36,226,336,403,437], userTps:[36,18.83,14.00,11.19,9.10], tpot:[27.8,53.1,71.4,89.4,109.9], fetch:{tps:[30,179,254,298,318], userTps:[30,14.92,10.58,8.28,6.63], tpot:[33.3,67.0,94.5,120.8,150.8]}, fp8:{ahead:{tps:[36,228,342,410,446], userTps:[36,19.00,14.25,11.39,9.29], tpot:[27.8,52.6,70.2,87.8,107.6]}, fetch:{tps:[30,180,258,302,325], userTps:[30,15.00,10.75,8.39,6.77], tpot:[33.3,66.7,93.0,119.2,147.7]}}, ttft:[14.6,51.0,94.6,138.3,182.0], last:[14.6,87.4,174.7,262.1,349.4] }
+        { id:'kimi-128', name:'Kimi Code 2.7', short:'Kimi 128K', context:128, max:28, color:'var(--s1)', tps:[5,66,127,166,191], userTps:[5.29,9.42,9.05,7.88,6.82], tpot:[189.1,106.1,110.4,126.9,146.6], fetch:{tps:[5,63,116,147,165], userTps:[5.27,9.04,8.30,6.98,5.91], tpot:[189.8,110.7,120.5,143.2,169.2]}, fp8:{ahead:{tps:[5,66,127,166,191], userTps:[5.29,9.42,9.05,7.88,6.82], tpot:[189.1,106.1,110.4,126.9,146.6]}, fetch:{tps:[5,63,117,149,170], userTps:[5.27,9.04,8.36,7.11,6.07], tpot:[189.8,110.7,119.6,140.6,164.9]}}, ttft:[16.6,66.4,124.5,182.6,240.7], last:[16.6,116.2,232.4,348.6,464.8] },
+        { id:'kimi-256', name:'Kimi Code 2.7', short:'Kimi 256K', context:256, max:14, color:'var(--s2)', tps:[4,23,50,74,91], userTps:[4.37,5.80,7.14,6.76,6.47], tpot:[229.0,172.4,140.1,147.9,154.6], fetch:{tps:[4,22,46,66,78], userTps:[4.34,5.61,6.63,6.02,5.60], tpot:[230.5,178.2,150.8,166.2,178.5]}, fp8:{ahead:{tps:[4,23,50,74,91], userTps:[4.37,5.80,7.14,6.76,6.47], tpot:[229.0,172.4,140.1,147.9,154.6]}, fetch:{tps:[4,22,47,67,80], userTps:[4.34,5.61,6.66,6.10,5.72], tpot:[230.5,178.2,150.3,163.9,174.9]}}, ttft:[43.2,108.0,172.8,259.2,324.0], last:[43.2,172.8,302.4,475.2,604.8] },
+        { id:'glm-128', name:'GLM-5.3', short:'GLM 128K', context:128, max:40, color:'var(--s3)', tps:[3,56,102,131,151], userTps:[2.76,5.63,5.09,4.36,3.77], tpot:[362.0,177.7,196.4,229.2,265.3], fetch:{tps:[3,54,93,115,130], userTps:[2.76,5.38,4.63,3.84,3.25], tpot:[362.8,186.0,216.2,260.4,308.0]}, fp8:{ahead:{tps:[3,56,102,131,151], userTps:[2.76,5.63,5.09,4.36,3.77], tpot:[362.0,177.7,196.4,229.2,265.3]}, fetch:{tps:[3,54,94,118,134], userTps:[2.76,5.38,4.69,3.93,3.35], tpot:[362.8,186.0,213.1,254.2,298.7]}}, ttft:[14.3,78.7,150.2,221.7,293.2], last:[14.3,143.0,286.0,429.0,572.0] },
+        { id:'glm-256', name:'GLM-5.3', short:'GLM 256K', context:256, max:30, color:'var(--s4)', tps:[2,38,68,88,99], userTps:[1.86,4.76,4.52,3.81,3.29], tpot:[537.1,210.1,221.1,262.3,304.0], fetch:{tps:[2,35,59,73,80], userTps:[1.86,4.42,3.94,3.18,2.68], tpot:[539.0,226.2,254.1,314.5,372.9]}, fp8:{ahead:{tps:[2,38,68,88,99], userTps:[1.86,4.76,4.52,3.81,3.29], tpot:[537.1,210.1,221.1,262.3,303.9]}, fetch:{tps:[2,36,60,75,83], userTps:[1.86,4.45,4.02,3.28,2.78], tpot:[539.0,224.9,249.0,305.0,359.6]}}, ttft:[28.7,129.2,229.6,344.4,444.9], last:[28.7,229.6,430.5,660.1,861.0] },
+        { id:'flash-128', name:'DeepSeek V4 Flash', short:'V4 Flash 128K', context:128, max:64, color:'var(--s5)', tps:[31,233,332,391,423], userTps:[31.10,14.55,10.38,8.15,6.62], tpot:[32.1,68.7,96.3,122.8,151.1], fetch:{tps:[31,228,321,374,402], userTps:[30.91,14.22,10.02,7.78,6.29], tpot:[32.3,70.3,99.8,128.5,159.1]}, fp8:{ahead:{tps:[31,233,332,391,423], userTps:[31.10,14.55,10.38,8.15,6.62], tpot:[32.1,68.7,96.3,122.8,151.1]}, fetch:{tps:[31,228,322,376,406], userTps:[30.91,14.22,10.05,7.84,6.35], tpot:[32.3,70.3,99.5,127.6,157.5]}}, ttft:[7.3,32.8,61.9,91.0,120.1], last:[7.3,58.2,116.5,174.7,232.9] },
+        { id:'flash-256', name:'DeepSeek V4 Flash', short:'V4 Flash 256K', context:256, max:48, color:'var(--s6)', tps:[26,173,253,299,324], userTps:[26.42,14.43,10.53,8.31,6.75], tpot:[37.9,69.3,95.0,120.4,148.3], fetch:{tps:[26,167,237,277,298], userTps:[26.11,13.89,9.90,7.70,6.20], tpot:[38.3,72.0,101.1,129.9,161.2]}, fp8:{ahead:{tps:[26,173,253,299,324], userTps:[26.42,14.43,10.53,8.31,6.75], tpot:[37.9,69.3,95.0,120.4,148.3]}, fetch:{tps:[26,167,239,280,302], userTps:[26.11,13.89,9.97,7.79,6.29], tpot:[38.3,72.0,100.3,128.4,158.9]}}, ttft:[14.6,51.0,94.6,138.3,182.0], last:[14.6,87.4,174.7,262.1,349.4] }
       ];
+      const sensitivity = {
+        'kimi-128': {bf16:{ahead:[[184.0,194.5],[100.5,112.3],[100.8,120.8],[115.2,139.5],[131.5,164.0]],fetch:[[184.8,194.7],[102.8,119.0],[108.1,130.6],[129.3,159.1],[156.6,193.4]]},fp8:{ahead:[[184.8,193.6],[99.8,112.3],[100.8,119.6],[115.9,139.6],[131.2,161.5]],fetch:[[184.5,195.5],[102.5,119.5],[109.9,133.2],[127.3,153.7],[148.2,182.9]]}},
+        'kimi-256': {bf16:{ahead:[[222.9,234.5],[164.7,180.5],[129.6,151.2],[134.2,163.0],[137.6,170.3]],fetch:[[224.7,238.0],[169.9,188.5],[138.3,163.7],[152.2,185.3],[158.8,200.0]]},fp8:{ahead:[[223.5,234.5],[164.8,180.2],[130.2,151.8],[132.5,161.3],[140.2,176.5]],fetch:[[224.5,237.5],[168.4,187.6],[138.3,163.0],[148.4,181.9],[155.5,196.2]]}},
+        'glm-128': {bf16:{ahead:[[355.9,369.2],[167.7,188.5],[181.6,212.0],[205.6,248.9],[237.4,292.8]],fetch:[[356.8,369.8],[175.2,196.6],[200.4,238.4],[237.4,285.7],[282.2,341.5]]},fp8:{ahead:[[356.8,369.4],[166.3,188.7],[180.9,214.0],[205.6,251.4],[239.8,291.8]],fetch:[[356.3,368.6],[175.2,198.6],[195.4,230.6],[229.8,278.0],[264.7,332.4]]}},
+        'glm-256': {bf16:{ahead:[[530.2,545.4],[194.7,222.9],[198.4,248.3],[232.6,289.4],[266.9,347.0]],fetch:[[530.7,546.1],[209.6,245.0],[228.2,281.9],[287.7,361.4],[332.5,437.5]]},fp8:{ahead:[[529.8,545.9],[196.8,226.9],[200.4,242.3],[232.0,292.1],[266.8,340.1]],fetch:[[531.8,548.3],[205.4,242.2],[221.5,274.9],[271.8,341.5],[313.1,408.2]]}},
+        'flash-128': {bf16:{ahead:[[30.6,33.9],[66.1,71.7],[92.5,99.6],[118.6,127.4],[145.4,157.1]],fetch:[[30.6,34.3],[67.7,73.0],[96.1,103.8],[122.3,133.6],[152.4,167.6]]},fp8:{ahead:[[30.7,33.9],[66.3,71.1],[92.8,100.4],[118.1,127.8],[146.0,158.4]],fetch:[[30.8,34.2],[67.7,72.9],[95.5,103.4],[122.3,133.0],[151.2,164.7]]}},
+        'flash-256': {bf16:{ahead:[[36.0,40.0],[66.3,73.1],[90.5,100.4],[114.4,127.3],[140.0,157.0]],fetch:[[36.4,40.7],[68.2,76.6],[95.6,106.9],[121.7,138.4],[150.8,170.1]]},fp8:{ahead:[[35.7,39.7],[66.5,72.4],[91.0,100.5],[113.3,128.6],[140.2,156.5]],fetch:[[36.1,40.6],[68.6,75.9],[94.7,105.5],[121.1,135.1],[148.0,168.1]]}}
+      };
       const chartConfig = {
         tps: { unit:'tokens/second', digits:0 },
         userTps: { unit:'tokens/second/user', digits:1 },
@@ -773,21 +783,21 @@
         <article class="card model-card">
           <span class="kicker">Kimi Code 2.7</span>
           <h3>Selection becomes visible</h3>
-          <p>The sparse working set still removes most dense attention traffic, but 61 sequential layer selectors and current-token cache fetches remain visible. Eight stages need enough independent requests to amortize pipeline bubbles. Full-admission TPOT is about 123/141 ms at 128K/256K.</p>
+          <p>The sparse working set still removes most dense attention traffic, but 61 sequential layer selectors and current-token cache fetches remain visible. Full-admission BF16 TPOT is about 169/179 ms at 128K/256K.</p>
           <p><strong>Planning cache:</strong> about 8.6/17.2 GiB exact CPU cache per request. With one eighth of the layers on each TP2 stage, the sharded GPU representation remains roughly 0.23/0.45 GiB per request per GPU.</p>
           <div class="maxima"><div><span>128K admitted max</span><strong>28 users</strong></div><div><span>256K admitted max</span><strong>14 users</strong></div></div>
         </article>
         <article class="card model-card">
           <span class="kicker">GLM-5.3</span>
           <h3>Serialized index cost dominates</h3>
-          <p>Offloading the exact latent cache still raises capacity, but current-query selection across 78 layers cannot be hidden. FP8 weight conversion and PP8 bubbles compound at low load. Full-admission TPOT reaches about 240/276 ms.</p>
+          <p>Offloading the exact latent cache still raises capacity, but current-query selection and miss materialization are charged across all 78 layers. Full-admission BF16 TPOT reaches about 308/373 ms.</p>
           <p><strong>Planning cache:</strong> about 11.0/21.9 GiB exact CPU cache per request. At 256K, 30 users consume roughly 657 GiB, split across two node-local host pools.</p>
           <div class="maxima"><div><span>128K admitted max</span><strong>40 users</strong></div><div><span>256K admitted max</span><strong>30 users</strong></div></div>
         </article>
         <article class="card model-card">
           <span class="kicker">DeepSeek V4 Flash</span>
           <h3>Smallest serialization penalty</h3>
-          <p>Only the larger ratio-4 path is modeled as selected and offloaded across 21 layers. Two four-GPU replicas remain, while official mixed-weight conversion moves full-load TPOT to about 151/151 ms.</p>
+          <p>Only the larger ratio-4 path is modeled as selected and offloaded across 21 layers. Two four-GPU replicas remain; full-load BF16 TPOT is about 159/161 ms.</p>
           <p><strong>Planning cache:</strong> offload only the ratio-4 portion, approximately 0.66/1.32 GiB per request. Preserve the trained compression and use 1.56% as a cap.</p>
           <div class="maxima"><div><span>128K admitted max</span><strong>64 users</strong></div><div><span>256K admitted max</span><strong>48 users</strong></div></div>
         </article>`,
@@ -817,7 +827,7 @@
               </tbody>
             </table>
           </div>
-          <p class="math-note">Payload times are per request at 31.5 GB/s usable PCIe bandwidth. At batch size \(C_r\), all misses share the replica links, so materialization grows approximately with \(C_r\).</p>
+          <p class="math-note">Payload times use 25 GB/s central usable PCIe bandwidth plus a 180 GB/s per-node host-DRAM ceiling. At batch size \(C_r\), all misses share the replica links, so materialization grows approximately with \(C_r\).</p>
 
           <h3>2. Causal ordering inside a layer</h3>
           <p>The current query must score landmarks, reduce across query groups, choose chunks, and identify misses before exact data can move. Key reconstruction/loading and value fetching may run in parallel; sparse attention waits for the slower branch:</p>
@@ -852,11 +862,12 @@
           <p>This conservatively reuses the Llama selector timing for the frontier-model layers. Efficient native indexers could be faster; unfused custom kernels could be slower.</p>
 
           <h3>4. End-to-end decode model</h3>
-          <p>Let \(T_{\mathrm{ahead}}(C,N)\) be the step-time center on Case A. Fetch-at-decode exposes both selection and current-token materialization:</p>
+          <p>Let \(T_{\mathrm{core}}(C,N)\) be the calibrated non-ShadowKV step-time floor. Fetch-at-decode exposes selection and materialization at every cache-bearing block:</p>
           \[
-            T_{\mathrm{fetch}}(C,N)=T_{\mathrm{ahead}}(C,N)
-            +L_{\mathrm{sel}}t_{\mathrm{select,block}}(C,N,R)
-            +t_{\mathrm{materialize}}(C,N).
+            T_{\mathrm{fetch}}(C,N)=T_{\mathrm{core}}(C,N)
+            +\sum_{\ell=1}^{L_{\mathrm{sel}}}
+            \left[t_{\mathrm{select},\ell}(C,N)
+            +\max(t_{K,\ell},t_{V,\ell})\right]+t_{\mathrm{PP/IB}}.
           \]
           \[
             Y_{\mathrm{total}}=\frac{1000C}{T_{\mathrm{fetch}}},
@@ -867,11 +878,11 @@
           \]
           <div class="math-step">
             <strong>Worked point: Kimi, 28×128K</strong>
-            <p>After native-INT4 conversion cost and PP8 pipeline overlap, the BF16-KV Case-A center is 353 tok/s. Exposing current-token selection and materialization lowers the fetch-at-decode center to 227 tok/s, or 8.1 tok/s per user and 123.3 ms TPOT.</p>
+            <p>The explicit per-block trace gives 165 tok/s with BF16 KV, or 5.9 tok/s per user and 169 ms TPOT. FP8 storage raises this only to 170 tok/s because low-rank reconstruction, landmark selection, and BF16 compute—not transferred bytes alone—dominate the added path.</p>
           </div>
           <div class="math-step">
             <strong>Full-admission centers, 128K / 256K</strong>
-            <p>With BF16 KV, Kimi falls from 353/171 to 227/99 aggregate tok/s; GLM from 260/211 to 167/109; V4 Flash from 514/437 to 423/318. With FP8 KV, the Case-B totals are 241/105, 173/112, and 431/325 respectively.</p>
+            <p>With FP8 KV, full-load aggregate totals are 170/80 tok/s for Kimi, 134/83 for GLM, and 406/302 for V4 Flash at 128K/256K. Corresponding BF16 totals are 165/78, 130/80, and 402/298.</p>
           </div>
 
           <h3>5. TTFT and completion latency</h3>
@@ -888,7 +899,7 @@
           <p>Chunked prefill can fill PP8 even for one long prompt. With 4K chunks, revised single-user centers are 16.6/43.2 s for Kimi, 14.3/28.7 s for GLM, and 7.3/14.6 s for V4 Flash at 128K/256K. Fetch-at-decode changes the first-token barrier only slightly relative to these seconds-long centers.</p>
 
           <h3>6. Sensitivity and queueing</h3>
-          <p><strong>Zero-reuse bound:</strong> with BF16 KV, setting \(r=0\) raises full-load TPOT to roughly 130/149 ms for Kimi, 253/297 ms for GLM, and 159/161 ms for V4 Flash at 128K/256K. Selection remains the dominant added term in this calibration.</p>
+          <p><strong>Sensitivity:</strong> 256 deterministic samples vary PCIe (18–29 GB/s), host DRAM (130–220 GB/s), FP8 dequant (240–520 GB/s), selector timing (20% log-normal spread), and materialization timing (25% spread). Reported p10–p90 bounds are scenario sensitivity, not measurement-derived confidence intervals.</p>
           <p>A 100% graph point is a finite closed batch. For a continuously arriving service, queue delay includes the familiar instability factor</p>
           \[
             W_q\propto\frac{\rho}{1-\rho},
@@ -896,9 +907,9 @@
           \]
           <p>Admission control and prefill headroom remain necessary even when all requests are known beforehand.</p>`,
         guidanceBody: `
-            <tr><td>Kimi Code 2.7 · 128K / 256K</td><td>14–21 / 7–11</td><td><span class="warn">Slow to acceptable</span>, roughly 7–11 tok/s</td><td>Every layer pays current-query selection; PP8 bubbles below this range</td></tr>
-            <tr><td>GLM-5.3 · 128K / 256K</td><td>10–20 / 8–15</td><td><span class="warn">Slow</span>, roughly 4–6 tok/s</td><td>Serialized selection, FP8 weight conversion, and PP8 bubbles</td></tr>
-            <tr><td>DeepSeek V4 Flash · 128K / 256K</td><td>≤32 / ≤24 across two replicas</td><td><span class="warn">Acceptable</span>, roughly 10–11 tok/s</td><td>Full memory admission dilutes each user below 7 tok/s</td></tr>`,
+            <tr><td>Kimi Code 2.7 · 128K / 256K</td><td>7–14 / 4–7</td><td><span class="warn">Slow</span>, roughly 6–9 tok/s</td><td>Every block pays current-query selection and miss materialization</td></tr>
+            <tr><td>GLM-5.3 · 128K / 256K</td><td>10–20 / 8–15</td><td><span class="warn">Very slow</span>, roughly 3–5 tok/s</td><td>78 serialized block barriers dominate</td></tr>
+            <tr><td>DeepSeek V4 Flash · 128K / 256K</td><td>≤32 / ≤24 across two replicas</td><td><span class="warn">Acceptable</span>, roughly 10–14 tok/s</td><td>Full admission dilutes each user to about 6 tok/s</td></tr>`,
         limitsList: `
           <li><strong>Not an A800 benchmark:</strong> selector scaling, aggregate throughput, and TPOT are planning centers with approximately ±40–60% uncertainty; cold TTFT may vary by at least ±50%.</li>
           <li><strong>Paper-to-model extrapolation:</strong> the serialized selector term uses ShadowKV’s Llama-3-8B per-block measurements without a favorable discount for GLM or Flash native indexers.</li>
@@ -978,40 +989,30 @@
           q_{\mathrm{bytes}}=
           \frac{1+4/128}{2}=0.515625.
         \]
-        <p>A byte-only model would multiply cache movement by 0.516. That is too optimistic on A800: it is an Ampere SM80 GPU, while native PTX E4M3 conversion instructions require SM90 or newer. The central estimate uses a fused load/dequantize/attention kernel and charges enough conversion/pipeline cost to raise the effective cache-path factor to</p>
+        <p>A byte-only 0.516 multiplier is too optimistic on A800. The event trace scales only stored-byte movement and adds explicit conversion before BF16 compute:</p>
         \[
-          q_{\mathrm{eff}}=0.72,
-          \qquad q_{\mathrm{eff}}\in[0.55,0.95]\ \text{as a sensitivity range}.
-        \]
-        <p>Let \(f_{\mathrm{KV}}\) be the fraction of the BF16-storage step time attributable to selected-cache movement and memory-bound attention. For every plotted point,</p>
-        \[
-          T_{\mathrm{FP8}}=
-          T_{\mathrm{BF16}}
-          \left[1-f_{\mathrm{KV}}(1-q_{\mathrm{eff}})\right],
-          \qquad
-          Y_{\mathrm{FP8}}=\frac{1000C}{T_{\mathrm{FP8}}}.
+          t_{\mathrm{FP8,path}}=
+          \frac{B_{\mathrm{FP8}}}{\beta_{\mathrm{PCIe/DRAM}}}
+          +\frac{n_{\mathrm{values}}}{\beta_{\mathrm{dequant}}},
+          \qquad \beta_{\mathrm{dequant}}=360\ \mathrm{Gvalue/s}.
         \]
         <div class="table-wrap">
           <table class="math-table">
-            <thead><tr><th>Candidate</th><th>Case-A full-load \(f_{\mathrm{KV}}\), 128K / 256K</th><th>Case-B full-load \(f_{\mathrm{KV}}\)</th><th>Exact host cache/request, FP8 128K / 256K</th></tr></thead>
+            <thead><tr><th>Candidate</th><th>Oracle full-load FP8 TPOT, 128K / 256K</th><th>Fetch full-load FP8 TPOT</th><th>Exact host cache/request, FP8 128K / 256K</th></tr></thead>
             <tbody>
-              <tr><td>Kimi Code 2.7</td><td>0.35 / 0.43</td><td>0.21 / 0.24</td><td>4.4 / 8.9 GiB</td></tr>
-              <tr><td>GLM-5.3</td><td>0.16 / 0.22</td><td>0.11 / 0.12</td><td>5.7 / 11.3 GiB</td></tr>
-              <tr><td>V4 Flash</td><td>0.07 / 0.08</td><td>0.06 / 0.065</td><td>0.34 / 0.68 GiB</td></tr>
+              <tr><td>Kimi Code 2.7</td><td>147 / 155 ms</td><td>165 / 175 ms</td><td>4.4 / 8.9 GiB</td></tr>
+              <tr><td>GLM-5.3</td><td>265 / 304 ms</td><td>299 / 360 ms</td><td>5.7 / 11.3 GiB</td></tr>
+              <tr><td>V4 Flash</td><td>151 / 148 ms</td><td>158 / 159 ms</td><td>0.34 / 0.68 GiB</td></tr>
             </tbody>
           </table>
         </div>
-        <p>Case B has a lower \(f_{\mathrm{KV}}\) because current-query landmark selection is serialized and unaffected by KV precision. V4 Flash has the smallest fraction because its trained cache compression already suppresses the relevant traffic.</p>
-        <div class="math-step">
-          <strong>InferSim bandwidth ceiling on the added A800 profile</strong>
-          <p>At 8×128K, its Qwen3-8B fallback changes TPOT from 17.10 to 11.58 ms; at 4×256K, from 16.96 to 11.43 ms—about a 32–33% reduction. InferSim simply halves KV bytes when benchmark data is absent, so those results are an optimistic ceiling, not the values used in the charts.</p>
-        </div>
+        <p>FP8 barely changes the oracle curves because the critical branch is usually low-rank key reconstruction, whose output and attention compute remain BF16. It helps fetch-at-decode slightly when value/latent transfer becomes the slower branch. This is deliberately less favorable than InferSim's byte-only fallback.</p>
         <div class="math-step">
           <strong>Central full-admission result</strong>
-          <p>Case A aggregate throughput becomes 392/194 tok/s for Kimi, 271/224 for GLM, and 525/446 for V4 Flash at 128K/256K. Case B becomes 241/105, 173/112, and 431/325 respectively. Kimi and GLM totals include PP8 fill efficiency; V4 Flash placement is unchanged.</p>
+          <p>Oracle-assisted aggregate throughput is 191/91 tok/s for Kimi, 151/99 for GLM, and 423/324 for V4 Flash at 128K/256K. Fetch-at-decode gives 170/80, 134/83, and 406/302 respectively.</p>
         </div>
         <p class="math-note"><strong>Admission interaction:</strong> FP8 KV nearly doubles raw cache capacity, but the revised 28/14, 40/30, and 64/48 ceilings are still set by pipeline/replica throughput knees and per-user TPOT—not by the last available byte of HBM.</p>
-        <p>Calibration sources: the local <a href="https://github.com/alibaba/InferSim">InferSim</a> source and A800 fallback runs; <a href="https://lenovopress.lenovo.com/lp1813.pdf">Lenovo's A800 specification</a>; and NVIDIA's <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/">PTX ISA documentation</a> for FP8 conversion target support.</p>
+        <p>Simulation sources: pinned <a href="https://github.com/casys-kaist/LLMServingSim">LLMServingSim</a> for PP partitioning and serving-trace conventions; pinned <a href="https://github.com/ByteDance-Seed/ShadowKV">ShadowKV</a> plus paper Table 13 for causal events; and NVIDIA's <a href="https://docs.nvidia.com/cuda/parallel-thread-execution/">PTX ISA documentation</a> for conversion constraints.</p>
       `;
 
       function interpolate(values, load) {
@@ -1033,6 +1034,15 @@
         if (caseMode === 'fetch' && series.fetch && series.fetch[metric]) return series.fetch[metric];
         return series[metric];
       }
+      function sensitivityRange(series, load) {
+        const policy = caseMode === 'fetch' ? 'fetch' : 'ahead';
+        const points = sensitivity[series.id][storageMode][policy];
+        if (load <= 0) return points[0];
+        if (load >= 100) return points[4];
+        const i = Math.min(3, Math.floor(load / 25));
+        const ratio = (load - loads[i]) / 25;
+        return [points[i][0] + (points[i + 1][0] - points[i][0]) * ratio, points[i][1] + (points[i + 1][1] - points[i][1]) * ratio];
+      }
       function niceMax(value) {
         if (value <= 10) return 10;
         const power = Math.pow(10, Math.floor(Math.log10(value)));
@@ -1048,7 +1058,10 @@
       }
       function tooltipValue(series, metric, load) {
         if (metric === 'tps' || metric === 'userTps') return throughputPair(series, load);
-        if (metric === 'tpot') return `${interpolate(metricValues(series,'tpot'), load).toFixed(0)} ms/token`;
+        if (metric === 'tpot') {
+          const range = sensitivityRange(series, load);
+          return `${interpolate(metricValues(series,'tpot'), load).toFixed(0)} ms/token · p10–p90 ${range[0].toFixed(0)}–${range[1].toFixed(0)}`;
+        }
         return `avg ${interpolate(series.ttft, load).toFixed(0)} s · last ${interpolate(series.last, load).toFixed(0)} s`;
       }
 
@@ -1166,10 +1179,11 @@
         scenarioTitle.textContent = `Selected scenario: ${label}`;
         scenarioBody.innerHTML = visibleSeries().map(series => {
           const tpot = interpolate(metricValues(series,'tpot'), selectedLoad);
+          const range = sensitivityRange(series, selectedLoad);
           const avg = interpolate(series.ttft, selectedLoad);
           const last = interpolate(series.last, selectedLoad);
           const completion = avg + 0.511 * tpot;
-          return `<tr><td><span class="series-name"><span class="swatch" style="background:${series.color}"></span>${escapeText(series.short)}</span></td><td>${userCount(series,selectedLoad)}</td><td>${throughputPair(series,selectedLoad)}</td><td>${tpot.toFixed(1)} ms</td><td>${avg.toFixed(1)} s</td><td>${last.toFixed(1)} s</td><td>${completion.toFixed(1)} s</td></tr>`;
+          return `<tr><td><span class="series-name"><span class="swatch" style="background:${series.color}"></span>${escapeText(series.short)}</span></td><td>${userCount(series,selectedLoad)}</td><td>${throughputPair(series,selectedLoad)}</td><td>${tpot.toFixed(1)} ms <small>(p10–p90 ${range[0].toFixed(0)}–${range[1].toFixed(0)})</small></td><td>${avg.toFixed(1)} s</td><td>${last.toFixed(1)} s</td><td>${completion.toFixed(1)} s</td></tr>`;
         }).join('');
       }
 
@@ -1193,9 +1207,9 @@
           .replaceAll('about 11.0/21.9 GiB', 'about 5.7/11.3 GiB')
           .replaceAll('roughly 657 GiB', 'roughly 339 GiB')
           .replaceAll('approximately 0.66/1.32 GiB', 'approximately 0.34/0.68 GiB')
-          .replaceAll('123/141 ms', '116/133 ms')
-          .replaceAll('240/276 ms', '231/268 ms')
-          .replaceAll('151/151 ms', '149/148 ms');
+          .replaceAll('169/179 ms', '165/175 ms')
+          .replaceAll('308/373 ms', '299/360 ms')
+          .replaceAll('159/161 ms', '158/159 ms');
       }
 
       function viewHash() {
@@ -1216,12 +1230,12 @@
         ui.hero.textContent = copy.hero;
         ui.kvFormatChip.textContent = isFp8 ? 'FP8 KV storage → BF16 compute' : 'BF16 exact-KV storage';
         ui.modeChip.textContent = copy.modeChip;
-        ui.reuseChip.hidden = caseMode !== 'fetch';
-        ui.statusChip.textContent = isFp8 ? 'Weight + KV dequant-aware, not benchmarked' : 'Weight-dequant aware, not benchmarked';
+        ui.reuseChip.hidden = false;
+        ui.statusChip.textContent = isFp8 ? 'LLMServingSim extension · FP8 dequant-aware' : 'LLMServingSim extension · not benchmarked';
         ui.fp8Summary.hidden = !isFp8;
         ui.fp8Result.innerHTML = caseMode === 'ahead'
-          ? '<strong>Full-admission center:</strong> Kimi reaches 392/194 total tok/s at 128K/256K, GLM 271/224, and V4 Flash 525/446. Kimi and GLM include PP8 fill efficiency plus the FP8-KV overlay.'
-          : '<strong>Full-admission center:</strong> Kimi reaches 241/105 total tok/s at 128K/256K, GLM 173/112, and V4 Flash 431/325. Serialized selection and PP8 bubbles remain the dominant Case-B penalties.';
+          ? '<strong>Full-admission center:</strong> Kimi reaches 191/91 total tok/s at 128K/256K, GLM 151/99, and V4 Flash 423/324. Landmark verification remains on the critical path despite oracle prefetch.'
+          : '<strong>Full-admission center:</strong> Kimi reaches 170/80 total tok/s at 128K/256K, GLM 134/83, and V4 Flash 406/302. Every cache-bearing block pays current-token selection and miss materialization.';
         ui.summaryTitle.textContent = copy.summaryTitle;
         ui.summaryGrid.innerHTML = copy.summaryGrid;
         ui.assumptionsNote.textContent = copy.assumptionsNote;

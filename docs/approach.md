@@ -62,20 +62,41 @@ B_{\mathrm{sel,GPU}}=
 
 The Python implementation is in `src/kvcache_offload_deploy_estimate/model.py`.
 
-## 5. Model the two cache-fetch cases
+## 5. Model the two cache-fetch cases with LLMServingSim events
+
+The tracked LLMServingSim checkout supplies the vLLM-compatible transformer-block
+pipeline partitioner and the vocabulary for per-stage traces. The ShadowKV extension
+lives in `src/kvcache_offload_deploy_estimate/llmservingsim_shadowkv.py`; upstream is
+not patched because its normal tiered block recall does not contain ShadowKV's
+per-block landmark-selection dependency.
+
+The extension inserts, for every cache-bearing transformer block:
+
+1. landmark GEMM/softmax, max reduction, and top-K selection;
+2. optional one-token-ahead background prefetch;
+3. the current token's just-in-time miss materialization;
+4. overlapping key reconstruction and value/latent fetch;
+5. FP8 dequantization before BF16 attention compute.
+
+ShadowKV Table 13 is a **per-transformer-block** measurement. Both selection and
+`max(reconstruct K, fetch V)` are therefore charged once per cache-bearing block.
 
 ### Case A: token-ahead prediction
 
-With predictor hit rate \(h=0.8\), false-positive prefetches and just-in-time misses
-produce
+Let \(r=0.60\) be entries reused from the preceding token. Over the remaining
+entries, the advisory oracle has recall \(R_o=0.80\) and precision \(P_o=0.80\).
+Prefetch and just-in-time traffic are
 
 \[
-B_{\mathrm{total}}=(2-h)B_{\mathrm{sel}}=1.2B_{\mathrm{sel}},
+B_{\mathrm{prefetch}}=(1-r)\frac{R_o}{P_o}B_{\mathrm{sel}}=0.40B_{\mathrm{sel}},
 \qquad
-B_{\mathrm{JIT}}=(1-h)B_{\mathrm{sel}}=0.2B_{\mathrm{sel}}.
+B_{\mathrm{JIT}}=(1-r)(1-R_o)B_{\mathrm{sel}}=0.08B_{\mathrm{sel}}.
 \]
 
-The 80% correct transfer is assumed to overlap useful work; the 20% miss is exposed.
+The current query still runs landmark selection to verify the exact set and discover
+misses. Prefetch may overlap the preceding token; selection and the 0.08 miss set are
+exposed. A perfect authoritative oracle would instead use recall=precision=1 and
+could optionally skip verification, but that is not the central case.
 
 ### Case B: fetch at decode
 
@@ -87,7 +108,7 @@ S_{\mathrm{miss}}=(1-r)S=0.4S.
 \]
 
 Key and value branches may overlap with each other, but sparse attention waits for
-both. Per layer,
+both. Per layer, and then summed over every cache-bearing block,
 
 \[
 t_{\mathrm{layer}}=t_{\mathrm{QKV}}+t_{\mathrm{select}}
@@ -135,12 +156,21 @@ One FP8 byte plus one FP32 scale per 128 values has byte ratio
 q_{\mathrm{bytes}}=\frac{1+4/128}{2}=0.515625
 \]
 
-relative to BF16 KV. Because A800/SM80 lacks Hopper's native FP8 conversion path,
-the estimate uses a fused load/dequantize/attention path with a more conservative
-effective cache-path ratio \(q_{\mathrm{eff}}=0.72\). Attention still computes in
-FP16/BF16.
+relative to BF16 KV. The extension does not apply a blanket effective multiplier.
+It scales stored-byte transfer by 0.515625, adds explicit dequantization at a central
+360 Gvalue/s, and leaves low-rank reconstruction plus attention in BF16. The
+sensitivity run samples 240–520 Gvalue/s. This makes FP8 gains small whenever key
+reconstruction is the critical materialization branch.
 
-## 8. Separate prefill TTFT from decode TPOT
+## 8. Parameter sensitivity, not confidence
+
+Each displayed center has a reproducible 256-sample sensitivity study. It varies
+usable PCIe bandwidth (18–29 GB/s), node host-DRAM bandwidth (130–220 GB/s), FP8
+dequantization (240–520 Gvalue/s), selector timing (20% log-normal spread), and
+materialization timing (25% spread). The resulting p10–p90 range is not a confidence
+interval: it omits architecture mismatch and unknown A800 frontier-model profiles.
+
+## 9. Separate prefill TTFT from decode TPOT
 
 Long prompts are split into 4K-token chunks. A 128K prompt supplies roughly 32
 pipeline microbatches and a 256K prompt supplies 64, giving PP8 fill efficiencies
@@ -159,7 +189,7 @@ For a simultaneous cold burst scheduled first-token-first,
 At sustained offered utilization \(\rho\to1\), queue delay is unbounded. The report's
 100% point is a finite closed batch, not a stable production operating target.
 
-## 9. Extend the repository with another case
+## 10. Extend the repository with another case
 
 A new deployment case should add:
 

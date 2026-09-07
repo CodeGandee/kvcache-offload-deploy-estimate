@@ -21,6 +21,23 @@ Inspect pipeline calibration points:
 pixi run kv-estimate 1 7 14 21 28 40
 ```
 
+Run the LLMServingSim-compatible ShadowKV extension and its 256-sample sensitivity
+study:
+
+```bash
+pixi run kv-shadowkv-sim --samples 256
+pixi run kv-shadowkv-sim --samples 256 --json
+pixi run kv-shadowkv-sim --oracle-recall 1 --oracle-precision 1 --trust-oracle
+```
+
+The last command is an optimistic authoritative-oracle upper bound. The published
+central case deliberately omits `--trust-oracle`, so it still verifies the current
+token with landmarks.
+
+The command imports `_pp_stage_boundaries` from the pinned LLMServingSim checkout,
+so submodules must be initialized. It then emits external per-transformer-block
+ShadowKV trace events without modifying the upstream simulator.
+
 ## External source revisions
 
 Clone with submodules or initialize them after cloning:
@@ -47,10 +64,11 @@ pipeline fill, sparse working-set size, per-GPU layout invariance, and TTFT form
 The report is standalone except for KaTeX assets loaded from jsDelivr. Its charts and
 case data are embedded directly in the HTML so the file can be opened locally.
 
-## Calibration boundary
+## Simulation boundary
 
-InferSim supplies an optimistic bandwidth-oriented cross-check, not the final
-end-to-end numbers. The A800 profile and fallback runs used in the investigation are
-documented in the interactive report's expandable methodology. Final figures also
-charge pipeline bubbles, current-token selector ordering, weight conversion, and
-FP8-KV conversion on SM80.
+LLMServingSim provides PP partitioning and serving-trace structure. Its checked-in
+profiles do not cover these frontier models on A800, and stock tiered-KV offload does
+not express ShadowKV's landmark/reconstruction path. The extension therefore retains
+the earlier calibrated non-ShadowKV model-forward floor and explicitly simulates only
+the incremental ShadowKV events. Do not describe these values as native LLMServingSim
+predictions or measured A800 results.

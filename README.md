@@ -9,7 +9,7 @@ on one or two 8×NVIDIA A800 80 GB servers. Kimi Code 2.7 and GLM-5.3 use PP8×T
 across two 400 Gb/s InfiniBand-connected servers; DeepSeek V4 Flash uses two
 four-GPU replicas on one server.
 
-> These are analytical planning centers, not measured A800 benchmarks. Read the
+> These are simulation-assisted planning centers, not measured A800 benchmarks. Read the
 > uncertainty section before using the numbers for capacity commitments.
 
 ## Current result
@@ -30,6 +30,7 @@ pixi install
 pixi run check
 pixi run docs
 pixi run kv-estimate 1 8 16 32
+pixi run kv-shadowkv-sim --samples 256
 ```
 
 If the repository was cloned without dependencies, initialize them with:
@@ -41,7 +42,8 @@ git submodule update --init --recursive
 ## Repository layout
 
 - `docs/`: methodology, cases, sources, and the interactive report.
-- `src/kvcache_offload_deploy_estimate/`: small auditable estimation formulas.
+- `src/kvcache_offload_deploy_estimate/`: auditable formulas and the external
+  LLMServingSim/ShadowKV trace model.
 - `tests/`: formula and publication-integrity checks.
 - `extern/tracked/`: pinned upstream research and model-code submodules.
 - `extern/orphan/`: ignored local-only experiments.

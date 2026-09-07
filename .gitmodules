@@ -19,3 +19,7 @@
 [submodule "llama-models"]
 	path = extern/tracked/llama-models
 	url = https://github.com/meta-llama/llama-models.git
+[submodule "extern/tracked/llmservingsim"]
+	path = extern/tracked/llmservingsim
+	url = https://github.com/casys-kaist/LLMServingSim.git
+	shallow = true

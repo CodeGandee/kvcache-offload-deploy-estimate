@@ -6,6 +6,7 @@
   Inference,” 2025.
 - [ShadowKV implementation](https://github.com/ByteDance-Seed/ShadowKV)
 - [InferSim](https://github.com/alibaba/InferSim)
+- [LLMServingSim](https://github.com/casys-kaist/LLMServingSim)
 - [NVIDIA PTX ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/)
 - [Lenovo NVIDIA A800 product guide](https://lenovopress.lenovo.com/lp1813.pdf)
 

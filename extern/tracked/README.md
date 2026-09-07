@@ -13,6 +13,7 @@ does not vendor model weights.
 | `kimi-k2.7-code` | Kimi checkpoint metadata and source/configuration | `74797c9c62378b951a1f6fcf5c4631024e9b8bef` |
 | `deepseek-v4-flash` | V4 Flash checkpoint metadata and source/configuration | `60d8d70770c6776ff598c94bb586a859a38244f1` |
 | `llama-models` | Llama 3.1 reference model code | `0e0b8c519242d5833d8c11bffc1232b77ad7f301` |
+| `llmservingsim` | Serving-trace conventions and vLLM-compatible PP partitioning | `a4053bc1161872420e1e0607cb3409ef659b828e` |
 
 Clone without large Git LFS payloads:
 
