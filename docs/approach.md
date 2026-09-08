@@ -7,7 +7,9 @@ This repository uses a reproducible three-part pipeline:
    decode/prefill roofline timings;
 3. generated timings are written in LLMServingSim's profile-bundle format and read
    through LLMServingSim's production interpolation path before external ShadowKV
-   events or the no-ShadowKV native-attention roofline are added.
+   events, native attention for layers outside the overlay, and the KDA state-update
+   roofline are added. The no-ShadowKV control uses the same native-attention and KDA
+   extensions.
 
 It is still a simulation. No frontier-model weights were downloaded or executed.
 
@@ -90,6 +92,28 @@ Tensor-parallel collectives use a GenZ ring-style latency/bandwidth expression w
 the measured P2P inputs. Two activation reductions per transformer block are
 included. No cross-node expert parallelism is modeled.
 
+The cache placement is **pure TP with decode-context parallel degree 1**. Pipeline
+stages own disjoint layer ranges, but an MLA latent row and a shared sparse-index row
+are not head-sharded: each TP rank in the stage retains a full copy. Query-head
+arithmetic remains TP-sharded. GLM-Flash's KDA recurrent state is also head-sharded.
+This distinction replaces the earlier blanket `1/TP` cache factor.
+
+The compact 576/512-value MLA cache and sparse-attention byte model assume an optimized
+custom MLA serving kernel that consumes the shared latent directly.
+In particular, Kimi's checked-in Transformers reference expands its latent state into
+per-head K/V before updating the standard cache; running that literal cache path would
+use materially more memory and attention bandwidth than this report. The direct-head
+arithmetic roof used below is therefore an optimistic lower-bound adapter, not a
+measured matrix-absorbed MLA kernel.
+
+As a geometry cross-check before deployment placement, the complete BF16 persistent
+state of one 256K sequence is 17.15625 GiB for Kimi, 22.61426 GiB for GLM
+(21.9375 GiB MLA plus 0.67676 GiB index), and 2.97610 GiB for GLM Flash
+(2.75 GiB MLA, 0.08862 GiB pooled index, and 0.13748 GiB fixed KDA). PP then assigns
+subsets of those layers to stages. Pure TP replicates each stage's MLA/index portion;
+only the GLM-Flash KDA portion is divided by TP8. These logical totals are explicit
+regression tests, so a future blanket `/TP` change will fail validation.
+
 ## LLMServingSim bridge
 
 The GenZ sweep covers 1–4,096 simultaneous sequences and is written to:
@@ -122,14 +146,19 @@ profile contract and supplies pipeline semantics.
 
 ## ShadowKV events
 
-For context \(N\), selected fraction \(\alpha=1/64\), cache-bearing layers \(L\),
-cached width \(d_c\), TP degree \(G\), and stored bytes/value \(b\):
+For context \(N\), selected fraction \(\alpha=1/64\), cache-bearing layers \(L_p\)
+on pipeline stage \(p\), cached width \(d_c\), and stored bytes/value \(b\):
 
 \[
 S(N)=\lceil\alpha N\rceil,
 \qquad
-B_{\mathrm{sel,GPU}}=\frac{S(N)Ld_cb}{G}.
+B_{\mathrm{sel,GPU},p}=S(N)L_pd_cb.
 \]
+
+The selected latent rows are replicated under pure TP. The direct-copy baseline has
+every TP rank DMA its own copy, so a stage with TP degree \(G_s\) places
+\(G_sB_{\mathrm{sel,GPU},p}\) on the node's host-memory service path. A runtime that
+loads once and broadcasts over NVLink is a separate optimization and is not assumed.
 
 After 60% temporal reuse, the central 80%-recall/80%-precision token-ahead oracle
 prefetches 0.40 of the selected set and leaves 0.08 just in time:
@@ -162,12 +191,48 @@ For a cache-bearing block:
 
 \[
 t_{\ell}=t_{\mathrm{select},\ell}
-+\max(t_{K,\ell},t_{V,\ell}+t_{\mathrm{dequant},\ell})
++\max(t_{K,\ell},t_{V,\ell})
 +t_{\mathrm{attention},\ell}.
 \]
 
-ShadowKV Table 13 grounds selector/materialization centers. Reusing its Llama
-per-block measurements on these architectures is a major extrapolation.
+ShadowKV Table 13 grounds three separate centers: landmark selection, overlapped
+materialization, and sparse attention. At 24×128K those are
+(0.58+0.07+0.15=0.80) ms, (max(1.36,1.66)=1.66) ms, and 0.21 ms per Llama
+block. The attention term is not hidden inside materialization: it is scaled by the
+selected-row count and the custom joint-latent width. Its lower bound is
+
+\[
+t_{\mathrm{attention},\ell}=\max\!\left(
+t_{\mathrm{Table13,scaled}},
+\frac{F_{\mathrm{sparse}}}{\eta_F F_{\max}},
+\mathbf 1_{\mathrm{FP8}}\frac{V_{\mathrm{selected}}}{D_{\mathrm{FP8}}}
+\right).
+\]
+
+Thus FP8 conversion is charged exactly once, when attention consumes the complete
+selected set, including temporally reused or full-resident rows. It is not added to
+miss materialization. The Table 13 memory center is preserved on the central A100
+proxy and scaled with measured HBM bandwidth; no separate uncited launch floor or
+GEMM-MBU substitution is added. Reusing these Llama per-block measurements on the
+target architectures remains a major extrapolation.
+
+For GLM Flash, GenZ includes projection/weight work but not the recurrent KDA state
+update. If stage \(p\) has \(L_{K,p}\) KDA layers, logical fixed-state bytes \(F_p\),
+TP degree \(G_s\), local sequence count \(b\), and \(k\) jointly verified positions,
+the separate lower bound is
+
+\[
+t_{\mathrm{KDA},p}=\max\!\left(
+\frac{7bkL_{K,p}(64/G_s)128^2}{\eta_F\,F_{\max}},
+\frac{2b(F_p/G_s)}{\eta_B\,B_{\mathrm{HBM}}}
+\right).
+\]
+
+The factor seven represents decay, state-key contraction, outer-product update, and
+state-query contraction. A fused multi-token verification reads and writes persistent
+state once per sequence while arithmetic scales with \(k\). This is a hardware lower
+bound rather than a measured fused KDA kernel; mixed FP32/BF16 arithmetic and launches
+can make a real implementation slower.
 
 For one TP2 stage with per-GPU bytes \(B_g\):
 
@@ -207,22 +272,36 @@ selected/outlier/local exact buffer. A fully resident overlaid layer uses
 \(Nd_c+n_Ld_c\). Native state outside the overlay remains in HBM in its official
 compressed or recurrent form.
 
-The number of layers is part of the per-GPU footprint. For stored bytes/value \(q\),
-TP degree \(G_s\), ShadowKV layers \(\mathcal L_{S,p}\), and native non-overlaid
-layers \(\mathcal L_{N,p}\) on PP stage \(p\):
+The number of layers is part of the per-GPU footprint. For main-cache bytes/value
+\(q\), ShadowKV layers \(\mathcal L_{S,p}\), native non-overlaid layers
+\(\mathcal L_{N,p}\), retained native index states \(\mathcal I_p\), index bytes per
+entry \(e_i\), and TP-sharded fixed KDA bytes \(F_p/G_s\) on PP stage \(p\):
 
 \[
-K_{\mathrm{GPU}}(q)=\frac{q}{G_s}\max_p\!\left[
+K_{\mathrm{GPU}}(q)=\max_p\!\left\{
+q\!\left[
 \sum_{\ell\in\mathcal L_{S,p}}V_{\mathrm{shadow},\ell}
 +\sum_{\ell\in\mathcal L_{N,p}}V_{\mathrm{native},\ell}
-\right].
+\right]
++\sum_{i\in\mathcal I_p}n_i e_i
++\frac{F_p}{G_s}
+\right\}.
 \]
 
-The current figures assume ideal TP sharding. Replicated cache state replaces
-\(q/G_s\) with \(q\). For Kimi 128K FP8, the busiest PP8 stage has eight layers:
-native cache is 0.290 GiB/request/GPU when TP2-sharded and 0.580 GiB when replicated,
-so the respective native ceilings are 108 and 54. The modeled ShadowKV footprint is
-0.1228 GiB when sharded and 0.2456 GiB when replicated, giving 255 and 127 users.
+GLM and GLM-Flash index entries remain 132 bytes in both main-cache modes: 128 FP8
+values plus one FP32 scale. The checked-in V4 Flash reference keeps its 128-value
+index row in BF16, or 256 bytes. The ShadowKV cases conservatively retain these
+trained index states in addition to the low-rank/landmark overlay; ShadowKV's measured
+selector timing is used as the selection proxy rather than charging a second index
+kernel. GLM-Flash also retains 34 fixed KDA states; each layer contributes a 4 MiB
+FP32 recurrent matrix plus about 0.140625 MiB of BF16 convolution state before TP8
+head sharding.
+
+For Kimi 128K FP8, the busiest PP8 stage has eight layers. Native cache is
+\(8\times131{,}072\times576\times1.03125/2^{30}\approx0.5801\)
+GiB/request/GPU, giving 54 users from 31.35 GiB of headroom. The modeled ShadowKV
+representation is 0.2456 GiB/request/GPU, giving 127 users. There is no `/TP2`
+factor in either pure-TP value.
 
 For the maximum-loaded stage GPU, the common planning OOM boundary is:
 
@@ -231,6 +310,12 @@ H_{\mathrm{GPU}}=0.90(80\ \mathrm{GiB})-W_{\mathrm{GPU}}-6\ \mathrm{GiB},
 \qquad
 C_{\max}=R\left\lfloor\frac{H_{\mathrm{GPU}}}{K_{\mathrm{GPU}}}\right\rfloor.
 \]
+
+Here (W_{\mathrm{GPU}}) is the checkpoint's total stored bytes divided evenly over
+the GPUs that hold one replica. It is not a stage-specific packed-weight footprint.
+Cache state is still evaluated on the busiest PP stage, so uneven real weight packing
+can move the Kimi/GLM whole-request boundary by a few requests. Exact deployment
+admission should replace this average with the final per-stage allocation manifest.
 
 The next whole request is rejected. The 90% allocation fraction makes this a
 configured OOM boundary rather than a claim that every physical HBM byte is usable.
@@ -243,12 +328,17 @@ that is native to a checkpoint. Kimi therefore scans dense MLA context; GLM and 
 Flash retain DSA; GLM Flash also retains 34 fixed-state KDA layers; and V4 Flash
 retains its 128-token windows and official 4×/128× compressed streams.
 
-For stage \(p\), native main-cache entries \(n_l(N)\), optional index-cache entries
-\(i_l(N)\), cached widths \(d_c,d_i\), storage bytes/value \(q\), and TP degree \(G_s\):
+For stage \(p\), native main-cache entries \(n_l(N)\), index-cache entries
+\(i_l(N)\), main cached width \(d_c\), main-cache bytes/value \(q\), fixed index-row
+bytes \(e_i\), and fixed KDA state \(F_p\):
 
 \[
 K_{\mathrm{GPU}}(N,q)=
-\max_p\frac{q}{G_s}\sum_{l\in p}[n_l(N)d_c+i_l(N)d_i].
+\max_p\left[
+q\sum_{l\in p}n_l(N)d_c
++\sum_{l\in p}i_l(N)e_i
++\frac{F_p}{G_s}
+\right].
 \]
 
 The no-offload admission ceiling uses the same HBM-only rule:
@@ -261,9 +351,9 @@ C_{\max}=R\left\lfloor\frac{H_{\mathrm{GPU}}}{K_{\mathrm{GPU}}}\right\rfloor.
 
 The first request above \(C_{\max}\) is rejected; no host spill or hidden wait queue is
 modeled. System-RAM capacity is likewise irrelevant to this case. The index allocation
-uses one 128-value key per indexed position shared
-across heads, matching the V4 Flash reference tensor. GLM uses the positions marked
-`full` in its official `indexer_types`; GLM Flash pools index positions by four.
+uses one 128-value key per indexed position shared across heads. GLM uses the positions
+marked `full` in its official `indexer_types`; GLM Flash pools index positions by four.
+Its index format is independent of the BF16/FP8 main-cache toggle.
 
 Native index scoring and main attention are sequential. Each receives a roofline over
 BF16 math, measured effective HBM bandwidth, and fused FP8 conversion:
@@ -278,12 +368,24 @@ t_x=\max\!\left(
 \]
 
 This is an optimistic analytical native-attention bound, not a measured sparse-gather
-kernel. It assumes ideal cache sharding across each TP group.
+kernel. HBM bytes and cache conversion are replicated per TP rank, while query-head
+FLOPs retain the \(1/G_s\) tensor-parallel factor.
+
+GLM Flash additionally pays \(t_{\mathrm{KDA},p}\) above in both ShadowKV and native
+cases. In the V4 ShadowKV cases, ratio-128/local-window layers outside the ratio-4
+overlay still pay their official native-attention roofline; they are not absorbed into
+the GenZ core or the sparse ShadowKV term.
+
+Decode context parallelism could sequence-shard the growing history by an explicit
+degree \(D\), but it would add distributed selection/top-k and partial-attention
+communication. That is not modeled here, and the retired ideal-sharding curves must
+not be relabeled as DCP results.
 
 ## TPOT and throughput
 
 For a PP microbatch of \(b\) sequences, let \(s_p(b)\) be the generated core
-time of stage \(p\), its local ShadowKV critical work, and its outgoing PP edge.
+time of stage \(p\), its local ShadowKV critical work, native attention for any
+non-overlaid layer, KDA state-update roof, and its outgoing PP edge.
 With \(g=\lceil C/b\rceil\) request groups, the LLMServingSim in-flight cap gives:
 
 \[
@@ -304,9 +406,9 @@ The known-request scheduler searches
 groups, underfill the pipeline, and cannot improve a monotone stage service curve.
 PP=1 placements retain the complete continuous batch.
 
-For Case C, \(s_p(b)\) replaces the ShadowKV critical work with native index and
-attention roofline time. It has no H2D service constraint, and the search stops at the
-memory-only admission ceiling above.
+For Case C, \(s_p(b)\) replaces the ShadowKV and non-overlaid terms with native index
+and attention roofline time while retaining the KDA update roof. It has no H2D service
+constraint, and the search stops at the memory-only admission ceiling above.
 
 \[
 Y_{\mathrm{total}}=\frac{1000C}{T_{\mathrm{step}}},
@@ -346,7 +448,10 @@ T_{\mathrm{core,verify}}(C,k)=T_{\mathrm{profile}}(kC).
 
 If the mean accepted prefix is \(A\), the round emits \(A+1\) tokens. In Cases A/B,
 the oracle applies only to the first position and later positions pay fetch-at-decode
-cache work. Case C instead verifies every position against the native HBM cache.
+cache work. Every target position still pays sparse attention. Case C instead verifies
+every position against the native HBM cache. For GLM Flash, fused target verification
+scales KDA arithmetic by \(k\) but reads/writes persistent state once; the approximate
+one-layer draft charge includes the average KDA-layer share.
 
 Residency requests are rounded to implementable whole layers:
 
@@ -355,8 +460,17 @@ n_{\mathrm{resident}}=\operatorname{round}(pL),
 \qquad p_{\mathrm{exact}}=n_{\mathrm{resident}}/L.
 \]
 
-Resident layers lose host fetch and low-rank reconstruction. The chart plots exact
-ratios and interpolates only between adjacent implementable points.
+Resident layers lose host fetch and low-rank reconstruction but retain landmark
+selection and sparse attention:
+
+\[
+T_{\mathrm{shadow}}(n)=L(T_{\mathrm{select}}+T_{\mathrm{attention}})
++(L-n)T_{\mathrm{offload}}.
+\]
+
+FP8 conversion for the selected set is already inside \(T_{\mathrm{attention}}\), so
+there is no extra resident-layer conversion term. The chart plots exact ratios and
+interpolates only between adjacent implementable points.
 
 ## Sensitivity
 

@@ -9,11 +9,18 @@ context on one or two 8×NVIDIA A800 80 GB servers. Kimi Code 2.7 and GLM-5.3 us
 PP8×TP2 across two 400 Gb/s InfiniBand-connected servers; GLM-5.3-Flash uses one TP8
 replica; DeepSeek V4 Flash uses two four-GPU replicas on one server.
 
+The published default is pure tensor parallelism with decode-context parallel degree
+1. MLA/latent history and sparse-index rows are replicated on every TP rank; only PP
+splits layers, while GLM-Flash's fixed KDA head state remains TP-sharded. Earlier
+`1/TP` cache figures have been retired rather than relabeled as DCP estimates.
+
 All three cases use a directly comparable HBM-only OOM admission boundary while
 treating system-RAM capacity as unbounded. The report also contains a no-ShadowKV
 control. It keeps each model's complete
 native growing attention state in HBM, retains native DSA/KDA/compressed-attention
 behavior, and rejects the first request beyond a memory-only whole-request ceiling.
+GLM index storage, V4's reference BF16 index storage, and mixed FP32/BF16 KDA state
+are accounted independently from the main BF16/FP8 cache toggle.
 
 The current pipeline reads official model configs, derives roofline service times with
 GenZ, serializes a 1–4,096-sequence sweep in LLMServingSim profile format, then adds the

@@ -1,6 +1,7 @@
 """Tests for the LLMServingSim-compatible ShadowKV event model."""
 
 import math
+from dataclasses import replace
 from itertools import pairwise
 
 import pytest
@@ -11,11 +12,16 @@ from kvcache_offload_deploy_estimate.llmservingsim_shadowkv import (
     OraclePrefetch,
     PolicyName,
     StorageName,
+    _fixed_sequence_state_bytes_by_stage,
+    _kda_state_update_stage_ms,
     _optimal_microbatch_size,
+    _shadowkv_attention_ms_per_block,
+    _table13_attention_ms,
     _transfer_time_ms,
     estimate_no_shadowkv_point,
     estimate_point,
     estimate_residency_scan,
+    index_cache_bytes_per_entry,
     native_cache_gib_per_gpu,
     native_hbm_headroom_gib,
     no_shadowkv_max_users,
@@ -178,6 +184,10 @@ def test_full_residency_removes_host_payload_and_reduces_tpot() -> None:
     )
     assert points[-1].estimate.tpot_ms < points[0].estimate.tpot_ms
     assert sum(event.bytes_moved for event in points[-1].estimate.trace_events) == 0
+    assert any(
+        event.name == "sparse_attention" and event.critical_ms > 0
+        for event in points[-1].estimate.trace_events
+    )
 
 
 def test_mtp_requires_checkpoint_component_and_two_accepts_beat_one() -> None:
@@ -282,10 +292,132 @@ def test_no_shadowkv_admission_is_a_full_native_cache_hbm_limit() -> None:
     scenario = next(item for item in SCENARIOS if item.id == "glm-256")
     bf16_max = no_shadowkv_max_users(scenario, storage="bf16")
     fp8_max = no_shadowkv_max_users(scenario, storage="fp8")
-    assert bf16_max == 14
-    assert fp8_max == 28
-    assert native_cache_gib_per_gpu(scenario, storage="bf16", users=bf16_max) <= 22.1
-    assert native_cache_gib_per_gpu(scenario, storage="bf16", users=bf16_max + 1) > 22.0
+    assert bf16_max == 7
+    assert fp8_max == 14
+    headroom = native_hbm_headroom_gib(scenario)
+    assert native_cache_gib_per_gpu(scenario, storage="bf16", users=bf16_max) <= headroom
+    assert native_cache_gib_per_gpu(scenario, storage="bf16", users=bf16_max + 1) > headroom
+
+
+def test_pure_tp_replicates_mla_cache_instead_of_dividing_by_tp() -> None:
+    scenario = next(item for item in SCENARIOS if item.id == "kimi-128")
+    # The busiest PP8 stage owns eight layers. Each TP2 rank retains a complete
+    # 576-value MLA row for those layers: 8 * 128K * 576 * 2 bytes = 1.125 GiB.
+    assert native_cache_gib_per_gpu(scenario, storage="bf16", users=1) == pytest.approx(1.125)
+    assert no_shadowkv_max_users(scenario, storage="fp8") == 54
+    assert shadowkv_max_users(scenario, storage="fp8") == 127
+
+
+def test_shadowkv_attention_is_charged_separately_from_materialization() -> None:
+    scenario = next(item for item in SCENARIOS if item.id == "kimi-128")
+    assert _table13_attention_ms(65_536) == pytest.approx(0.23)
+    assert _table13_attention_ms(131_072) == pytest.approx(0.21)
+    assert _table13_attention_ms(262_144) == pytest.approx(0.19)
+    assert _table13_attention_ms(524_288) == pytest.approx(0.18)
+    reference_width = replace(scenario, cached_width=2_048, tp_size=1)
+    assert _shadowkv_attention_ms_per_block(
+        reference_width,
+        sequences=24,
+        storage="bf16",
+        hardware=A800Host(),
+    ) == pytest.approx(0.21)
+    bf16 = _shadowkv_attention_ms_per_block(
+        scenario,
+        sequences=24,
+        storage="bf16",
+        hardware=A800Host(),
+    )
+    fp8 = _shadowkv_attention_ms_per_block(
+        scenario,
+        sequences=24,
+        storage="fp8",
+        hardware=A800Host(),
+    )
+    assert bf16 == pytest.approx(0.21 * 576 / 2_048)
+    assert fp8 > bf16  # At this point the explicit FP8 conversion roof takes over.
+    assert _shadowkv_attention_ms_per_block(
+        scenario,
+        sequences=24,
+        storage="bf16",
+        hardware=A800Host(decode_gemm_mbu=0.10),
+    ) == pytest.approx(bf16)  # Sparse-attention calibration is not a GEMM-MBU proxy.
+    slow_dequant = _shadowkv_attention_ms_per_block(
+        scenario,
+        sequences=24,
+        storage="fp8",
+        hardware=A800Host(fp8_dequant_gbps=1.0),
+    )
+    values = 24 * math.ceil(131_072 / 64) * 576
+    assert slow_dequant == pytest.approx(values / 1e9 * 1000.0)
+
+
+def test_256k_logical_context_totals_match_official_cache_geometry() -> None:
+    kimi = replace(next(item for item in SCENARIOS if item.id == "kimi-256"), pp_size=1, tp_size=1)
+    glm = replace(next(item for item in SCENARIOS if item.id == "glm-256"), pp_size=1, tp_size=1)
+    glm_flash = replace(
+        next(item for item in SCENARIOS if item.id == "glm-flash-256"),
+        pp_size=1,
+        tp_size=1,
+    )
+    assert native_cache_gib_per_gpu(kimi, storage="bf16", users=1) == pytest.approx(17.15625)
+    assert native_cache_gib_per_gpu(glm, storage="bf16", users=1) == pytest.approx(22.6142578125)
+    assert native_cache_gib_per_gpu(glm_flash, storage="bf16", users=1) == pytest.approx(
+        2.976104736328125
+    )
+
+
+def test_index_cache_format_is_independent_of_main_kv_storage() -> None:
+    glm = next(item for item in SCENARIOS if item.id == "glm-128")
+    v4 = next(item for item in SCENARIOS if item.id == "flash-128")
+    assert index_cache_bytes_per_entry(glm) == 132
+    assert index_cache_bytes_per_entry(v4) == 256
+    # Fixed-format indexes stop the total native footprint from scaling by the
+    # same 2/1.03125 ratio as the main cache.
+    ratio = native_cache_gib_per_gpu(glm, storage="bf16", users=1) / native_cache_gib_per_gpu(
+        glm, storage="fp8", users=1
+    )
+    assert ratio < 2.0 / 1.03125
+
+
+def test_glm_flash_charges_tp_sharded_fixed_kda_state() -> None:
+    scenario = next(item for item in SCENARIOS if item.id == "glm-flash-256")
+    main = 11 * 262_144 * 512 * 2.0
+    index = 11 * math.ceil(262_144 / 4) * 132
+    recurrent = 34 * (64 * 128 * 128 * 4 + 3 * 64 * 128 * 3 * 2) / 8
+    expected = (main + index + recurrent) / 2**30
+    assert native_cache_gib_per_gpu(scenario, storage="bf16", users=1) == pytest.approx(expected)
+    assert expected == pytest.approx(2.8558082580566406)
+    state_bytes = _fixed_sequence_state_bytes_by_stage(scenario)[0]
+    kda_ms = _kda_state_update_stage_ms(scenario, sequences=1, hardware=A800Host())[0]
+    assert kda_ms == pytest.approx(2 * state_bytes / (0.516 * 2039e9) * 1000.0)
+    assert _kda_state_update_stage_ms(
+        scenario,
+        sequences=1,
+        positions=2,
+        hardware=A800Host(),
+    )[0] == pytest.approx(kda_ms)  # Fused verification updates persistent state once.
+
+
+def test_shadow_trace_exposes_sparse_and_unshadowed_attention() -> None:
+    kimi = next(item for item in SCENARIOS if item.id == "kimi-128")
+    kimi_point = estimate_point(
+        kimi,
+        load_index=0,
+        policy="oracle-prefetch",
+        storage="fp8",
+        sensitivity_samples=0,
+    )
+    assert any(event.name == "sparse_attention" for event in kimi_point.trace_events)
+
+    v4 = next(item for item in SCENARIOS if item.id == "flash-128")
+    v4_point = estimate_point(
+        v4,
+        load_index=0,
+        policy="oracle-prefetch",
+        storage="fp8",
+        sensitivity_samples=0,
+    )
+    assert any(event.name == "native_unshadowed_attention_hbm" for event in v4_point.trace_events)
 
 
 def test_no_shadowkv_trace_has_no_host_transfer_or_landmark_selection() -> None:

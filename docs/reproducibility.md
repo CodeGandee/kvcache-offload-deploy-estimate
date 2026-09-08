@@ -66,7 +66,8 @@ regenerates those profiles automatically. The estimator then reads the profiles
 through LLMServingSim's `_lookup_per_sequence`, imports its
 `_pp_stage_boundaries`, and emits either external per-transformer-block ShadowKV
 events or the native-cache attention roofline without modifying either upstream
-project.
+project. Both paths also add the GLM-Flash KDA recurrent-state lower bound; ShadowKV
+cases retain native attention for any V4 layers outside the overlay.
 
 The Pixi dependency installs GenZ's Python dependency set, while the adapter prepends
 the pinned `extern/tracked/genz-llm-analyzer` checkout to `sys.path`. Consequently the
@@ -96,7 +97,9 @@ The gitlinks pin exact source/metadata commits. See `extern/tracked/README.md` a
 three serving cases, the PP8×TP2 topology, 72K data, MTP cases, whole-layer residency
 controls, and central result markers. Unit tests additionally verify the native-cache
 HBM ceiling, rejection immediately past that ceiling, and absence of host-transfer or
-landmark events in the no-ShadowKV trace.
+landmark events in the no-ShadowKV trace. Regression checks cover pure-TP MLA
+replication, the logical 256K context totals, fixed index formats, the separate
+Table-13 sparse-attention term, non-overlaid native attention, and KDA state timing.
 
 The report is standalone except for KaTeX assets loaded from jsDelivr. Its charts and
 case data are embedded directly in the HTML so the file can be opened locally.
@@ -109,8 +112,9 @@ The project therefore uses GenZ to generate the missing model-core tables from o
 config dimensions and stored precisions. The central hardware envelope combines the
 GenZ A100 compute-efficiency prior with the measured A100 HBM, BF16 GEMM MBU, fused
 dequantization, H2D, and P2P values. LLMServingSim consumes those generated tables and
-provides interpolation and PP partitioning; both ShadowKV events and the native
-attention/cache control are external adapters. For PP8, the estimator searches
+provides interpolation and PP partitioning; ShadowKV selection/materialization/
+attention, native attention, and KDA recurrent-state work are external adapters. For
+PP8, the estimator searches
 microbatch sizes that retain at least eight
 request groups and applies LLMServingSim's pipeline-depth recurrence; this is an
 analytical steady-state schedule rather than an ASTRA-Sim execution.

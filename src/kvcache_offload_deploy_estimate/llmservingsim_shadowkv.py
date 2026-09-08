@@ -7,8 +7,9 @@ both.  This module adds those events without modifying the tracked upstream sour
 
 The non-ShadowKV model-forward component comes from official-config operator graphs
 evaluated by GenZ and consumed through LLMServingSim's profile-table interface.
-Everything added here (selection, prefetch traffic, miss materialization, and FP8 KV
-conversion) is calculated explicitly and is therefore independently inspectable.
+Everything added here (selection, prefetch traffic, miss materialization, sparse/native
+attention, KDA recurrence, and FP8 KV conversion) is calculated explicitly and is
+therefore independently inspectable.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import sys
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from functools import lru_cache
+from itertools import pairwise
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -273,6 +275,103 @@ def stored_bytes_per_value(storage: StorageName) -> float:
     return 2.0 if storage == "bf16" else 1.0 + 4.0 / 128.0
 
 
+GLM_INDEX_BYTES_PER_ENTRY = 128.0 + 4.0
+V4_INDEX_BYTES_PER_ENTRY = 128.0 * 2.0
+KDA_HEADS = 64
+KDA_HEAD_DIM = 128
+KDA_RECURRENT_BYTES_PER_LAYER = KDA_HEADS * KDA_HEAD_DIM * KDA_HEAD_DIM * 4.0
+KDA_CONV_BYTES_PER_LAYER = 3.0 * KDA_HEADS * KDA_HEAD_DIM * (4.0 - 1.0) * 2.0
+KDA_BYTES_PER_LAYER = KDA_RECURRENT_BYTES_PER_LAYER + KDA_CONV_BYTES_PER_LAYER
+
+
+def index_cache_bytes_per_entry(scenario: Scenario) -> float:
+    """Return the model-native index row size, independent of main-KV storage.
+
+    Current vLLM GLM index caches use 128 FP8 values plus one FP32 scale.  The
+    checked-in DeepSeek V4 reference allocates its 128-value index cache in BF16.
+    Kimi has no persistent sparse-attention index cache.
+    """
+
+    if scenario.model_key in {"glm", "glm-flash"}:
+        return GLM_INDEX_BYTES_PER_ENTRY
+    if scenario.model_key == "deepseek-flash":
+        return V4_INDEX_BYTES_PER_ENTRY
+    return 0.0
+
+
+def _index_cache_dequant_values_per_entry(scenario: Scenario) -> int:
+    """Values converted by the fixed-format index path on each TP rank."""
+
+    if scenario.model_key in {"glm", "glm-flash"}:
+        return MODEL_SPECS[scenario.model_key].index_dim
+    return 0
+
+
+def _linear_layer_counts_by_stage(scenario: Scenario) -> tuple[int, ...]:
+    counts = stage_layer_counts(scenario.model_layers, scenario.pp_size)
+    spec = MODEL_SPECS[scenario.model_key]
+    if scenario.model_key != "glm-flash":
+        return (0,) * scenario.pp_size
+    values: list[int] = []
+    start = 0
+    for count in counts:
+        stage_types = spec.layer_types[start : start + count]
+        values.append(sum(layer == "linear_attention" for layer in stage_types))
+        start += count
+    return tuple(values)
+
+
+def _fixed_sequence_state_bytes_by_stage(scenario: Scenario) -> tuple[float, ...]:
+    """Return TP-sharded, fixed per-sequence state for each PP stage/GPU."""
+
+    return tuple(
+        layers * KDA_BYTES_PER_LAYER / scenario.tp_size
+        for layers in _linear_layer_counts_by_stage(scenario)
+    )
+
+
+def _kda_state_update_stage_ms(
+    scenario: Scenario,
+    *,
+    sequences: int,
+    positions: int = 1,
+    hardware: A800Host,
+) -> tuple[float, ...]:
+    """Roofline the fixed-state GLM-Flash KDA recurrence on each TP rank.
+
+    Projection weights remain in the GenZ core.  This adds only the recurrent
+    state-vector contractions/update and one read plus write of the mixed-precision
+    state.  Jointly verified ``positions`` scale arithmetic but, under the assumed
+    fused chunk kernel, not persistent-state traffic.  It is a hardware lower bound,
+    not a measured fused KDA kernel.
+    """
+
+    if sequences < 1 or positions < 1:
+        raise ValueError("sequences and positions must be positive")
+    effective_compute_tflops = hardware.peak_bf16_tflops * hardware.bf16_compute_efficiency
+    effective_hbm_gbps = hardware.decode_gemm_mbu * 2039.0
+    return tuple(
+        max(
+            7.0
+            * sequences
+            * positions
+            * layers
+            * (KDA_HEADS / scenario.tp_size)
+            * KDA_HEAD_DIM**2
+            / (effective_compute_tflops * 1e12)
+            * 1000.0,
+            2.0 * sequences * state_bytes / (effective_hbm_gbps * 1e9) * 1000.0,
+        )
+        if layers
+        else 0.0
+        for layers, state_bytes in zip(
+            _linear_layer_counts_by_stage(scenario),
+            _fixed_sequence_state_bytes_by_stage(scenario),
+            strict=True,
+        )
+    )
+
+
 def selector_ms_per_block(users: int, context_tokens: int) -> float:
     """Interpolate ShadowKV Table 13's landmark-selection measurements.
 
@@ -293,7 +392,6 @@ def _paper_materialize_ms_per_block(
     cached_width: int,
     miss_fraction: float,
     storage: StorageName,
-    dequant_gbps: float,
 ) -> tuple[float, float, float]:
     """Return (critical materialization, fetch, reconstruction) per block.
 
@@ -301,7 +399,8 @@ def _paper_materialize_ms_per_block(
     24×128K and a 40% miss set after its 60% temporal cache reuse.  Payload work
     scales with batch, selected tokens, and the frontier model's cached width.
     A small fixed kernel component is retained.  FP8 affects stored bytes, while
-    reconstruction still produces BF16 operands and pays an explicit conversion.
+    reconstruction still produces BF16 operands. Exact-row FP8 conversion is charged
+    once when the separate sparse-attention kernel consumes the full selected set.
     """
 
     if miss_fraction <= 0.0:
@@ -314,11 +413,74 @@ def _paper_materialize_ms_per_block(
     byte_ratio = stored_bytes_per_value(storage) / 2.0
     fetch_ms = 0.18 + (1.48 + 0.09 * context_octaves) * work * byte_ratio
     reconstruct_ms = 0.22 + (1.14 + 0.13 * context_octaves) * work
-    dequant_ms = 0.0
-    if storage == "fp8":
-        values = users * selected_entries(context_tokens) * cached_width * miss_fraction
-        dequant_ms = values / (dequant_gbps * 1e9) * 1000.0
-    return max(fetch_ms + dequant_ms, reconstruct_ms), fetch_ms, reconstruct_ms
+    return max(fetch_ms, reconstruct_ms), fetch_ms, reconstruct_ms
+
+
+def _table13_attention_ms(context_tokens: int) -> float:
+    """Interpolate ShadowKV Table 13's separately reported attention kernel."""
+
+    anchors = ((65_536, 0.23), (131_072, 0.21), (262_144, 0.19), (524_288, 0.18))
+    log_context = math.log2(context_tokens)
+    if context_tokens <= anchors[0][0]:
+        left, right = anchors[0], anchors[1]
+    elif context_tokens >= anchors[-1][0]:
+        left, right = anchors[-2], anchors[-1]
+    else:
+        left, right = next(
+            (left, right)
+            for left, right in pairwise(anchors)
+            if left[0] <= context_tokens <= right[0]
+        )
+    fraction = (log_context - math.log2(left[0])) / (math.log2(right[0]) - math.log2(left[0]))
+    return left[1] + fraction * (right[1] - left[1])
+
+
+def _shadowkv_attention_ms_per_block(
+    scenario: Scenario,
+    *,
+    sequences: int,
+    storage: StorageName,
+    hardware: A800Host,
+) -> float:
+    """Return the sparse-attention roof for one overlaid layer.
+
+    Table 13 reports attention separately from selection, K reconstruction, and V
+    fetching.  Its 24x128K point processes 2,048 BF16 K/V entries with a 2,048-value
+    combined row.  The custom MLA adapter scales that measured memory roof by selected
+    rows and its joint latent width, while direct per-head BF16 arithmetic remains
+    head-sharded.  FP8 storage also pays the explicit fused conversion roof.  This is
+    an optimistic direct-attention lower bound; a matrix-absorbed MLA kernel needs its
+    own model-specific score and accumulator dimensions.
+    """
+
+    if sequences < 1:
+        raise ValueError("sequences must be positive")
+    spec = MODEL_SPECS[scenario.model_key]
+    entries = sequences * selected_entries(scenario.context_tokens)
+    values = entries * scenario.cached_width
+    reference_entries = 24 * 2_048
+    table_hbm_ms = (
+        _table13_attention_ms(scenario.context_tokens)
+        * entries
+        / reference_entries
+        * scenario.cached_width
+        / 2_048.0
+        * stored_bytes_per_value(storage)
+        / 2.0
+        * 1_765.0
+        / hardware.hbm_stream_gbps
+    )
+    flops = (
+        2.0
+        * entries
+        * spec.attention_heads
+        * (spec.qk_head_dim + spec.v_head_dim)
+        / scenario.tp_size
+    )
+    effective_compute_tflops = hardware.peak_bf16_tflops * hardware.bf16_compute_efficiency
+    compute_ms = flops / (effective_compute_tflops * 1e12) * 1000.0
+    dequant_ms = values / (hardware.fp8_dequant_gbps * 1e9) * 1000.0 if storage == "fp8" else 0.0
+    return max(table_hbm_ms, compute_ms, dequant_ms)
 
 
 def _stage_cache_bytes(
@@ -331,7 +493,6 @@ def _stage_cache_bytes(
         selected_entries(scenario.context_tokens)
         * scenario.cached_width
         * stored_bytes_per_value(storage)
-        / scenario.tp_size
     )
     return tuple(count * per_layer for count in layer_counts)
 
@@ -387,7 +548,6 @@ def resident_cache_gib_per_gpu(
         * scenario.cached_width
         * stored_bytes_per_value(storage)
         * local_users
-        / scenario.tp_size
     )
     return max(resident_counts, default=0) * bytes_per_layer_gpu / 2**30
 
@@ -456,17 +616,20 @@ def native_cache_gib_per_gpu(
 
     if users < 1:
         raise ValueError("users must be positive")
-    spec = MODEL_SPECS[scenario.model_key]
     local_users = math.ceil(users / scenario.replicas)
-    stage_values = [
+    main_bytes_per_value = stored_bytes_per_value(storage)
+    index_bytes_per_entry = index_cache_bytes_per_entry(scenario)
+    fixed_bytes = _fixed_sequence_state_bytes_by_stage(scenario)
+    stage_bytes = [
         sum(
-            layer.main_entries * scenario.cached_width + layer.index_entries * spec.index_dim
+            layer.main_entries * scenario.cached_width * main_bytes_per_value
+            + layer.index_entries * index_bytes_per_entry
             for layer in stage
         )
-        for stage in _native_stage_layers(scenario)
+        + fixed
+        for stage, fixed in zip(_native_stage_layers(scenario), fixed_bytes, strict=True)
     ]
-    per_gpu_values = max(stage_values, default=0.0) * local_users / scenario.tp_size
-    return per_gpu_values * stored_bytes_per_value(storage) / 2**30
+    return max(stage_bytes, default=0.0) * local_users / 2**30
 
 
 SHADOW_RANK = 160
@@ -540,40 +703,58 @@ def shadowkv_cache_gib_per_gpu(
     if not 0 <= resident_layers <= scenario.cache_layers:
         raise ValueError("resident layer count is outside the ShadowKV overlay")
 
-    spec = MODEL_SPECS[scenario.model_key]
     mask = _shadowed_layer_mask(scenario)
     native_layers = native_cache_layers(scenario)
     model_stage_counts = stage_layer_counts(scenario.model_layers, scenario.pp_size)
     shadow_counts: list[int] = []
-    unshadowed_values: list[float] = []
+    unshadowed_main_values: list[float] = []
+    retained_index_bytes: list[float] = []
+    index_bytes_per_entry = index_cache_bytes_per_entry(scenario)
     start = 0
     for count in model_stage_counts:
         stage_mask = mask[start : start + count]
         stage_native = native_layers[start : start + count]
         shadow_counts.append(sum(stage_mask))
-        unshadowed_values.append(
+        unshadowed_main_values.append(
             float(
                 sum(
                     layer.main_entries * scenario.cached_width
-                    + layer.index_entries * spec.index_dim
                     for layer, shadowed in zip(stage_native, stage_mask, strict=True)
                     if not shadowed
                 )
             )
         )
+        # The overlay is conservative: it retains each checkpoint's trained DSA
+        # index state while adding ShadowKV's landmark/low-rank representation.
+        retained_index_bytes.append(
+            sum(layer.index_entries for layer in stage_native) * index_bytes_per_entry
+        )
         start += count
 
     resident_counts = _resident_counts_by_stage(shadow_counts, resident_layers)
     offloaded_per_layer, resident_per_layer = _shadowkv_layer_value_counts(scenario)
-    stage_values = [
-        (shadowed - resident) * offloaded_per_layer + resident * resident_per_layer + native_values
-        for shadowed, resident, native_values in zip(
-            shadow_counts, resident_counts, unshadowed_values, strict=True
+    main_bytes_per_value = stored_bytes_per_value(storage)
+    fixed_bytes = _fixed_sequence_state_bytes_by_stage(scenario)
+    stage_bytes = [
+        (
+            (shadowed - resident) * offloaded_per_layer
+            + resident * resident_per_layer
+            + native_main_values
+        )
+        * main_bytes_per_value
+        + index_bytes
+        + fixed
+        for shadowed, resident, native_main_values, index_bytes, fixed in zip(
+            shadow_counts,
+            resident_counts,
+            unshadowed_main_values,
+            retained_index_bytes,
+            fixed_bytes,
+            strict=True,
         )
     ]
     local_users = math.ceil(users / scenario.replicas)
-    per_gpu_values = max(stage_values, default=0.0) * local_users / scenario.tp_size
-    return per_gpu_values * stored_bytes_per_value(storage) / 2**30
+    return max(stage_bytes, default=0.0) * local_users / 2**30
 
 
 def native_hbm_headroom_gib(
@@ -648,6 +829,7 @@ def _native_attention_stage_ms(
     sequences: int,
     storage: StorageName,
     hardware: A800Host,
+    include_mask: Sequence[bool] | None = None,
 ) -> tuple[tuple[float, ...], tuple[float, ...]]:
     """Return native attention roofline time and cache bytes read per PP stage.
 
@@ -659,24 +841,34 @@ def _native_attention_stage_ms(
 
     if sequences < 1:
         raise ValueError("sequences must be positive")
+    if include_mask is None:
+        include_mask = (True,) * scenario.model_layers
+    if len(include_mask) != scenario.model_layers:
+        raise ValueError("native-attention mask must cover every model layer")
     spec = MODEL_SPECS[scenario.model_key]
     bytes_per_value = stored_bytes_per_value(storage)
+    index_bytes_per_entry = index_cache_bytes_per_entry(scenario)
+    index_dequant_values_per_entry = _index_cache_dequant_values_per_entry(scenario)
     effective_hbm_gbps = hardware.decode_gemm_mbu * 2039.0
     effective_compute_tflops = hardware.peak_bf16_tflops * hardware.bf16_compute_efficiency
     stage_times = []
     stage_bytes = []
-    for stage in _native_stage_layers(scenario):
-        main_values = (
-            sequences
-            * sum(layer.attended_entries * scenario.cached_width for layer in stage)
-            / scenario.tp_size
+    mask_stages = []
+    start = 0
+    for count in stage_layer_counts(scenario.model_layers, scenario.pp_size):
+        mask_stages.append(include_mask[start : start + count])
+        start += count
+    for stage, stage_mask in zip(_native_stage_layers(scenario), mask_stages, strict=True):
+        included = tuple(layer for layer, keep in zip(stage, stage_mask, strict=True) if keep)
+        main_values = sequences * sum(
+            layer.attended_entries * scenario.cached_width for layer in included
         )
         main_flops = (
             2.0
             * sequences
             * sum(
                 layer.attended_entries * spec.attention_heads * (spec.qk_head_dim + spec.v_head_dim)
-                for layer in stage
+                for layer in included
             )
             / scenario.tp_size
         )
@@ -687,53 +879,27 @@ def _native_attention_stage_ms(
             (main_values / (hardware.fp8_dequant_gbps * 1e9) * 1000.0 if storage == "fp8" else 0.0),
         )
 
-        index_values = (
-            sequences
-            * sum(layer.index_entries * spec.index_dim for layer in stage)
-            / scenario.tp_size
-        )
+        index_entries = sequences * sum(layer.index_entries for layer in included)
         index_flops = (
             2.0
             * sequences
-            * sum(layer.index_entries * spec.index_heads * spec.index_dim for layer in stage)
+            * sum(layer.index_entries * spec.index_heads * spec.index_dim for layer in included)
             / scenario.tp_size
         )
-        index_bytes = index_values * bytes_per_value
+        index_bytes = index_entries * index_bytes_per_entry
         index_ms = max(
             index_flops / (effective_compute_tflops * 1e12) * 1000.0,
             index_bytes / (effective_hbm_gbps * 1e9) * 1000.0,
             (
-                index_values / (hardware.fp8_dequant_gbps * 1e9) * 1000.0
-                if storage == "fp8"
-                else 0.0
+                index_entries
+                * index_dequant_values_per_entry
+                / (hardware.fp8_dequant_gbps * 1e9)
+                * 1000.0
             ),
         )
         stage_times.append(main_ms + index_ms)
         stage_bytes.append(main_bytes + index_bytes)
     return tuple(stage_times), tuple(stage_bytes)
-
-
-def _resident_materialize_ms_per_block(
-    *,
-    users: int,
-    context_tokens: int,
-    cached_width: int,
-    miss_fraction: float,
-    storage: StorageName,
-    dequant_gbps: float,
-) -> float:
-    """Optional FP8 conversion when an exact full-layer KV cache is already in HBM.
-
-    Resident layers retain exact K and V, so neither host fetch nor low-rank key
-    reconstruction is needed after landmark selection.  The sparse HBM gather is part
-    of the calibrated attention floor; only an explicit unfused FP8 conversion remains.
-    """
-
-    if storage == "bf16" or miss_fraction <= 0.0:
-        return 0.0
-    values = users * selected_entries(context_tokens) * cached_width * miss_fraction
-    dequant_ms = values / (dequant_gbps * 1e9) * 1000.0
-    return dequant_ms
 
 
 def _transfer_time_ms(
@@ -811,6 +977,20 @@ def _estimate_once(
     verified_core_stages = scenario.core_stage_tpot_for_sequences(
         batch_users * verification_tokens, hardware
     )
+    unshadowed_mask = tuple(not shadowed for shadowed in _shadowed_layer_mask(scenario))
+    unshadowed_attention_stages, unshadowed_cache_bytes = _native_attention_stage_ms(
+        scenario,
+        sequences=batch_users * verification_tokens,
+        storage=storage,
+        hardware=hardware,
+        include_mask=unshadowed_mask,
+    )
+    kda_stages = _kda_state_update_stage_ms(
+        scenario,
+        sequences=batch_users,
+        positions=verification_tokens,
+        hardware=hardware,
+    )
 
     events: list[TraceEvent] = []
     selector_block = selector_ms_per_block(batch_users, scenario.context_tokens) * selector_scale
@@ -827,24 +1007,11 @@ def _estimate_once(
         cached_width=scenario.cached_width,
         miss_fraction=miss_fraction,
         storage=storage,
-        dequant_gbps=hardware.fp8_dequant_gbps,
     )
     materialize_block *= materialize_scale
-    resident_materialize_block = (
-        _resident_materialize_ms_per_block(
-            users=batch_users,
-            context_tokens=scenario.context_tokens,
-            cached_width=scenario.cached_width,
-            miss_fraction=miss_fraction,
-            storage=storage,
-            dequant_gbps=hardware.fp8_dequant_gbps,
-        )
-        * materialize_scale
-    )
 
     extra_selector_block = 0.0
     extra_materialize_block = 0.0
-    extra_resident_materialize_block = 0.0
     extra_transfer_factor = 0.0
     if verification_tokens > 1:
         extra_users = batch_users * (verification_tokens - 1)
@@ -858,21 +1025,16 @@ def _estimate_once(
             cached_width=scenario.cached_width,
             miss_fraction=1.0 - reuse,
             storage=storage,
-            dequant_gbps=hardware.fp8_dequant_gbps,
         )
         extra_materialize_block *= materialize_scale
-        extra_resident_materialize_block = (
-            _resident_materialize_ms_per_block(
-                users=extra_users,
-                context_tokens=scenario.context_tokens,
-                cached_width=scenario.cached_width,
-                miss_fraction=1.0 - reuse,
-                storage=storage,
-                dequant_gbps=hardware.fp8_dequant_gbps,
-            )
-            * materialize_scale
-        )
         extra_transfer_factor = (verification_tokens - 1) * (1.0 - reuse)
+
+    attention_block = _shadowkv_attention_ms_per_block(
+        scenario,
+        sequences=batch_users * verification_tokens,
+        storage=storage,
+        hardware=hardware,
+    )
 
     stage_critical_times: list[float] = []
     for stage, (layers, resident, bytes_for_stage) in enumerate(
@@ -882,7 +1044,7 @@ def _estimate_once(
         offloaded = layers - resident
         must_select = policy == "fetch-at-decode" or oracle.verify_with_landmarks
         selection = layers * selector_block if must_select else 0.0
-        materialize = offloaded * materialize_block + resident * resident_materialize_block
+        materialize = offloaded * materialize_block
         transfer = _transfer_time_ms(
             stage_bytes_per_gpu=bytes_for_stage * offloaded / layers,
             factor=miss_fraction,
@@ -894,9 +1056,7 @@ def _estimate_once(
         # physical-link result is a lower bound that takes over when larger than it.
         materialize = max(materialize, transfer)
         extra_selection = layers * extra_selector_block
-        extra_materialize = (
-            offloaded * extra_materialize_block + resident * extra_resident_materialize_block
-        )
+        extra_materialize = offloaded * extra_materialize_block
         extra_transfer = _transfer_time_ms(
             stage_bytes_per_gpu=bytes_for_stage * offloaded / layers,
             factor=extra_transfer_factor,
@@ -905,7 +1065,9 @@ def _estimate_once(
             hardware=hardware,
         )
         extra_materialize = max(extra_materialize, extra_transfer)
-        stage_critical = selection + materialize + extra_selection + extra_materialize
+        pre_attention = selection + materialize + extra_selection + extra_materialize
+        attention = layers * attention_block
+        stage_critical = pre_attention + attention
         stage_critical_times.append(stage_critical)
         events.append(
             TraceEvent(
@@ -916,7 +1078,7 @@ def _estimate_once(
                     if verification_tokens > 1
                     else "landmark_select+miss_materialize"
                 ),
-                critical_ms=stage_critical,
+                critical_ms=pre_attention,
                 bytes_moved=(
                     bytes_for_stage
                     * offloaded
@@ -924,6 +1086,14 @@ def _estimate_once(
                     * (miss_fraction + extra_transfer_factor)
                     * batch_users
                 ),
+            )
+        )
+        events.append(
+            TraceEvent(
+                stage=stage,
+                node=node,
+                name="sparse_attention",
+                critical_ms=attention,
             )
         )
 
@@ -979,16 +1149,30 @@ def _estimate_once(
         # One checkpoint MTP block per config. Its active path is approximated by
         # one full-model layer, while the target verification itself comes from the
         # generated profile at the enlarged token batch above.
-        draft_core = profile_floor * verification_tokens / scenario.model_layers
+        draft_kda = sum(
+            _kda_state_update_stage_ms(
+                scenario,
+                sequences=batch_users,
+                hardware=hardware,
+            )
+        )
+        draft_core = verification_tokens * (
+            profile_floor / scenario.model_layers + draft_kda / scenario.model_layers
+        )
         draft_materialize, _, _ = _paper_materialize_ms_per_block(
             users=batch_users,
             context_tokens=scenario.context_tokens,
             cached_width=scenario.cached_width,
             miss_fraction=1.0 - reuse,
             storage=storage,
-            dequant_gbps=hardware.fp8_dequant_gbps,
         )
-        draft_block = selector_block + draft_materialize * materialize_scale
+        draft_attention = _shadowkv_attention_ms_per_block(
+            scenario,
+            sequences=batch_users,
+            storage=storage,
+            hardware=hardware,
+        )
+        draft_block = selector_block + draft_materialize * materialize_scale + draft_attention
         mtp_draft = draft_core + verification_tokens * draft_block
         events.append(
             TraceEvent(
@@ -1000,10 +1184,39 @@ def _estimate_once(
         )
 
     stage_critical_times[-1] += mtp_draft
+    for stage, (attention_ms, bytes_read, kda_ms) in enumerate(
+        zip(unshadowed_attention_stages, unshadowed_cache_bytes, kda_stages, strict=True)
+    ):
+        node = min(scenario.nodes - 1, stage * scenario.nodes // scenario.pp_size)
+        if attention_ms:
+            events.append(
+                TraceEvent(
+                    stage=stage,
+                    node=node,
+                    name="native_unshadowed_attention_hbm",
+                    critical_ms=attention_ms,
+                    bytes_moved=bytes_read,
+                )
+            )
+        if kda_ms:
+            events.append(
+                TraceEvent(
+                    stage=stage,
+                    node=node,
+                    name="kda_state_update_roofline",
+                    critical_ms=kda_ms,
+                )
+            )
+
     stage_services = [
-        core + shadow + communication
-        for core, shadow, communication in zip(
-            verified_core_stages, stage_critical_times, stage_communications, strict=True
+        core + shadow + native_attention + kda + communication
+        for core, shadow, native_attention, kda, communication in zip(
+            verified_core_stages,
+            stage_critical_times,
+            unshadowed_attention_stages,
+            kda_stages,
+            stage_communications,
+            strict=True,
         )
     ]
     # LLMServingSim caps in-flight batches at PP depth. With fewer groups, a
@@ -1203,6 +1416,12 @@ def _estimate_no_shadowkv_once(
         storage=storage,
         hardware=hardware,
     )
+    kda_stages = _kda_state_update_stage_ms(
+        scenario,
+        sequences=batch_users,
+        positions=verification_tokens,
+        hardware=hardware,
+    )
 
     stage_communications = [0.0] * scenario.pp_size
     if scenario.pp_size > 1:
@@ -1225,6 +1444,16 @@ def _estimate_no_shadowkv_once(
             zip(attention_stages, cache_bytes, strict=True)
         )
     ]
+    events.extend(
+        TraceEvent(
+            stage=stage,
+            node=min(scenario.nodes - 1, stage * scenario.nodes // scenario.pp_size),
+            name="kda_state_update_roofline",
+            critical_ms=kda_ms,
+        )
+        for stage, kda_ms in enumerate(kda_stages)
+        if kda_ms
+    )
 
     mtp_draft = 0.0
     if verification_tokens > 1:
@@ -1235,8 +1464,15 @@ def _estimate_no_shadowkv_once(
             storage=storage,
             hardware=hardware,
         )
+        one_kda = _kda_state_update_stage_ms(
+            scenario,
+            sequences=batch_users,
+            hardware=hardware,
+        )
         mtp_draft = verification_tokens * (
-            one_core / scenario.model_layers + sum(one_attention) / scenario.model_layers
+            one_core / scenario.model_layers
+            + sum(one_attention) / scenario.model_layers
+            + sum(one_kda) / scenario.model_layers
         )
         events.append(
             TraceEvent(
@@ -1248,9 +1484,9 @@ def _estimate_no_shadowkv_once(
         )
 
     stage_services = [
-        core + attention + communication
-        for core, attention, communication in zip(
-            core_stages, attention_stages, stage_communications, strict=True
+        core + attention + kda + communication
+        for core, attention, kda, communication in zip(
+            core_stages, attention_stages, kda_stages, stage_communications, strict=True
         )
     ]
     stage_services[-1] += mtp_draft
@@ -1601,7 +1837,7 @@ def build_report(
             cast(dict[str, Any], item["results"])[storage] = storage_results
         series.append(item)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "engine": {
             "name": "GenZ roofline → LLMServingSim profile tables → ShadowKV trace extension",
             "genz_commit": GENZ_COMMIT,
@@ -1622,7 +1858,24 @@ def build_report(
             "oracle_lookahead_tokens": oracle.lookahead_tokens,
             "selection_verified_at_decode": oracle.verify_with_landmarks,
             "admission": "HBM-only OOM boundary; system-RAM capacity is unbounded",
-            "tensor_parallel_cache_placement": "ideal sharding; all busiest-stage layers included",
+            "tensor_parallel_cache_placement": (
+                "pure TP with DCP=1: MLA/latent history and model-native index state "
+                "are replicated on every TP rank"
+            ),
+            "shadowkv_native_index_retained": True,
+            "index_storage": (
+                "GLM/GLM Flash: 128 FP8 values + one FP32 scale (132 bytes/entry); "
+                "V4 Flash reference: 128 BF16 values (256 bytes/entry)"
+            ),
+            "glm_flash_kda_state": (
+                "FP32 recurrent matrix plus BF16 convolution state; head-sharded across TP8; "
+                "decode uses a separate read/write-plus-arithmetic roofline lower bound"
+            ),
+            "shadowkv_attention": (
+                "Table 13's separate sparse-attention column is scaled by selected rows and "
+                "the custom joint-latent width, then roofed against direct TP-sharded BF16 "
+                "arithmetic and FP8 conversion; no uncited launch floor is added"
+            ),
             "hbm_utilization": 0.90,
             "runtime_reserve_gib_per_gpu": 6.0,
         },
@@ -1810,7 +2063,7 @@ def build_interactive_dataset(*, sensitivity_samples: int = 256) -> dict[str, An
             cast(dict[str, Any], item["residency"])[storage] = residency_storage
         series.append(item)
     return {
-        "schemaVersion": 6,
+        "schemaVersion": 7,
         "loads": [0, 25, 50, 75, 100],
         "residencyLoads": list(residency_loads),
         "residencyRequested": list(range(0, 101, 10)),
@@ -1821,8 +2074,22 @@ def build_interactive_dataset(*, sensitivity_samples: int = 256) -> dict[str, An
             "hbmUtilization": 0.90,
             "runtimeReserveGiB": 6.0,
             "systemRAMCapacity": "unbounded",
-            "tensorParallelCachePlacement": "ideal-sharded",
-            "tpReplicationSensitivity": "remove the 1/TP cache factor; Kimi-128 FP8 ShadowKV falls from 255 to 127 users",
+            "tensorParallelCachePlacement": "pure-tp-replicated-mla",
+            "decodeContextParallelDegree": 1,
+            "dcpSensitivity": (
+                "not plotted; sequence sharding requires a separate communication model and "
+                "must not be inferred by dividing pure-TP latency by TP"
+            ),
+            "shadowKVRetainsNativeIndexState": True,
+            "glmIndexStorageBytesPerEntry": GLM_INDEX_BYTES_PER_ENTRY,
+            "v4IndexStorageBytesPerEntry": V4_INDEX_BYTES_PER_ENTRY,
+            "glmFlashKDABytesPerLayer": KDA_BYTES_PER_LAYER,
+            "glmFlashKDAStateIsTPSharded": True,
+            "glmFlashKDAFusedMTPStateReadWriteOncePerRound": True,
+            "shadowKVAttentionIsSeparateTable13Term": True,
+            "shadowKVFP8ConversionChargedOnceAtAttention": True,
+            "shadowKVAttentionHasNoAssumedLaunchFloor": True,
+            "shadowKVUnshadowedNativeAttentionIsCharged": True,
             "residentLayersAreBalancedAcrossStages": True,
             "shadowKVAdmissionIsMemoryOnly": True,
             "shadowKVRank": SHADOW_RANK,

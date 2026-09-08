@@ -92,8 +92,9 @@ def selected_payload_bytes_per_gpu(
 ) -> float:
     """Return balanced selected-cache bytes per GPU and request.
 
-    The formula assumes that pipeline stages own disjoint layer ranges and TP ranks
-    shard the selected cache rather than replicate it.
+    Pipeline stages own disjoint layer ranges.  The MLA/latent cache is replicated
+    across pure tensor-parallel ranks (DCP=1), so TP does not divide the per-rank
+    payload.  This balanced helper therefore divides only by pipeline stages.
     """
 
     if cache_layers <= 0 or cached_width <= 0 or bytes_per_value <= 0:
@@ -103,7 +104,7 @@ def selected_payload_bytes_per_gpu(
         * cache_layers
         * cached_width
         * bytes_per_value
-        / topology.total_gpus
+        / topology.pipeline_stages
     )
 
 

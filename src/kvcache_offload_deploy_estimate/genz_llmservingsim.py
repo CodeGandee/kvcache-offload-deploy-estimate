@@ -605,9 +605,10 @@ def generate_profile_bundles() -> list[Path]:
             # Full-resident no-offload baselines can admit several hundred
             # compressed-cache requests. Keep those local-batch rows inside
             # LLMServingSim's interpolation domain instead of clamping at 128.
-            # The HBM-only ShadowKV boundary reaches 1,212 sequences for the
-            # smallest-cache case, and MTP verification expands that batch by
-            # as much as three. Keep all displayed points inside the table.
+            # The corrected HBM-only ShadowKV boundary reaches 226 sequences for
+            # the smallest-cache case, while native compressed-cache controls and
+            # MTP verification can still expand the queried local batch. Keep all
+            # displayed points comfortably inside the table.
             for sequences in range(1, 4097):
                 total_ms = analytical_decode_ms(spec.key, sequences)
                 writer.writerow(

@@ -20,6 +20,8 @@ The first published case covers:
 - ShadowKV-style 1.56% cache selection.
 - A common HBM-only OOM admission boundary for every case, with system-RAM capacity
   unbounded and finite host-transfer bandwidth retained in latency.
+- Pure TP with DCP1: MLA/latent history, native sparse-index rows, ShadowKV state, and
+  direct-copy H2D payload are replicated per TP rank; PP alone partitions layers.
 - An advisory token-ahead oracle with 80% recall/precision and a fetch-at-decode case,
   both with 60% temporal reuse.
 - A no-ShadowKV control that preserves native attention/cache compression, keeps all
@@ -27,6 +29,8 @@ The first published case covers:
 - Separate native-MTP plots for one and two mean consecutively accepted draft tokens.
 - Whole-layer exact-KV HBM residency from 0% through 100%, with a one-user/10%-step
   load slider and explicit HBM-feasibility markers.
+- Fixed-format GLM/V4 index caches and GLM-Flash's TP-sharded mixed-precision KDA
+  state, accounted separately from the main BF16/FP8 cache toggle.
 - GenZ model-core rooflines generated from official model configs, stored precision,
   and an A100-SXM4 hardware envelope, then consumed as LLMServingSim profiles.
 - A100-SXM4 measurements of HBM, PCIe sharing, NVLink/P2P, BF16 GEMM MBU, and fused

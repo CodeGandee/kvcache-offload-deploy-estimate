@@ -32,7 +32,7 @@ def test_selected_entries_match_128k_and_256k_cases() -> None:
     assert selected_entries(262_144) == 4_096
 
 
-def test_selected_payload_is_topology_invariant() -> None:
+def test_selected_payload_is_replicated_across_pure_tp_ranks() -> None:
     pp8 = selected_payload_bytes_per_gpu(
         context_tokens=131_072,
         cache_layers=61,
@@ -47,8 +47,8 @@ def test_selected_payload_is_topology_invariant() -> None:
         bytes_per_value=2.0,
         topology=PP2_TP8,
     )
-    assert pp8 == pp2
-    assert isclose(pp8 / (1024 * 1024), 8.578125)
+    assert pp2 == 4 * pp8
+    assert isclose(pp8 / (1024 * 1024), 17.15625)
 
 
 @pytest.mark.parametrize(

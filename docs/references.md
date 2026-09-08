@@ -21,6 +21,9 @@
 - [DeepSeek V4 Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
 - [vLLM GLM-5 recipe](https://github.com/vllm-project/recipes/blob/main/models/zai-org/GLM-5.yaml)
 - [vLLM DeepSeek V4 Flash recipe](https://github.com/vllm-project/recipes/blob/main/models/deepseek-ai/DeepSeek-V4-Flash.yaml)
+- [vLLM context-parallel deployment and MLA cache replication](https://docs.vllm.ai/en/latest/serving/context_parallel_deployment/)
+- [vLLM MLA cache representation](https://docs.vllm.ai/en/latest/api/vllm/model_executor/layers/attention/mla_attention/)
+- [vLLM GLM-5.3-Flash KDA implementation](https://docs.vllm.ai/en/latest/api/vllm/models/glm5next/nvidia/kda/)
 - [Meta Llama models](https://github.com/meta-llama/llama-models)
 
 Exact revisions used for code inspection are pinned as submodules in
