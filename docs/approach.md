@@ -140,6 +140,20 @@ f_{\mathrm{prefetch}}=(1-r)\frac{R_o}{P_o}=0.40,
 f_{\mathrm{JIT}}=(1-r)(1-R_o)=0.08.
 \]
 
+Here temporal reuse is one-token working-set overlap: 60% of the entries selected
+for the current token are assumed to remain in the GPU sparse buffer from the prior
+token. Recall and precision are then evaluated only over the remaining 40% true
+miss set. For a 100-entry selected set, 60 are resident; the predictor correctly
+prefetches 32 of the 40 misses. At 80% precision it prefetches 40 entries in total,
+so 8 are false positives, while the 8 false negatives are fetched just in time.
+Total transfer is therefore 48 entry-equivalents, but only 8 remain on the ideal
+critical path.
+
+The 60% central value is adapted from ShadowKV's reported roughly 60% chunk hit
+rate. The 80% oracle recall and precision are hypothetical sensitivity assumptions
+for the proposed token-ahead extension, not measurements reported by ShadowKV or
+validated on the target frontier models.
+
 Prefetch overlaps the preceding token's model-forward window. The current token
 still verifies landmarks. Fetch-at-decode has no background prefetch and exposes
 the full 40% post-reuse miss set.

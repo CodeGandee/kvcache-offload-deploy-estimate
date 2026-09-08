@@ -372,7 +372,7 @@
           <ul id="model-assumptions-list">
             <li>Official Hugging Face storage formats are retained: Kimi native INT4, GLM and GLM Flash FP8 with documented BF16 exclusions, and V4 Flash mixed FP4/FP8. Fused kernels dequantize into registers/shared memory and compute in BF16; no persistent BF16 weight copy is allocated.</li>
             <li>Exactly 1.56% of context entries are selected: 1,152 at 72K, 2,048 at 128K, and 4,096 at 256K.</li>
-            <li>Temporal reuse retains 60% of the selected set. Over the remaining 40%, the one-token-ahead oracle has 80% recall and 80% precision: it prefetches 0.40× the selected set and leaves 0.08× for just-in-time materialization.</li>
+            <li>Temporal reuse is one-token set overlap: 60% of the entries needed by the current token are assumed to remain in the GPU sparse buffer from the preceding token. Over the other 40%, 80% recall means the oracle fetches 80% of the truly needed entries early, while 80% precision means only 80% of everything it prefetches is useful. For 100 selected entries, that is 60 resident, 32 correctly prefetched, 8 unnecessarily prefetched, and 8 fetched just in time.</li>
             <li>The current query still runs landmark selection to verify the required set and discover oracle misses. Only prefetch and reconstruction that finish before their consumer are hidden.</li>
             <li>Every cache-bearing transformer block is charged separately, following ShadowKV Table 13's causal order: select → max(reconstruct K, fetch V) → sparse attention.</li>
             <li>No quality degradation from sparse selection and no pathological attention pattern that defeats the predictor.</li>
@@ -699,12 +699,35 @@
           \]
 
           <h3>2. Oracle recall, precision, reuse, and PCIe traffic</h3>
-          <p>Let \(r=0.60\) be temporal reuse from the preceding token, \(R_o=0.80\) oracle recall, and \(P_o=0.80\) oracle precision, all measured over entries not already resident. This separates useful coverage from false-positive traffic:</p>
+          <p>Let \(S_t\) be the exact entries selected for the current token and \(H_{t-1}\) the entries retained in the GPU sparse buffer after the preceding token. Temporal reuse is the fraction of the current required set that is already resident, \(r=|S_t\cap H_{t-1}|/|S_t|=0.60\). This is one-step working-set overlap—not shared-prefix reuse and not 60% of the full context.</p>
+          <p>The oracle predicts only among the required entries that are not already resident. If \(M_t=S_t\setminus H_{t-1}\) is that miss set and \(P_t\) is the set prefetched one token ahead, then</p>
+          \[
+            R_o=\frac{|P_t\cap M_t|}{|M_t|}=0.80,
+            \qquad
+            P_o=\frac{|P_t\cap M_t|}{|P_t|}=0.80.
+          \]
+          <p>Recall measures how much of the true miss set was covered early; precision measures how much speculative traffic was useful. These definitions separate useful coverage from false-positive traffic:</p>
           \[
             B_{\mathrm{prefetch}}=(1-r)\frac{R_o}{P_o}B_{\mathrm{sel}}=0.40B_{\mathrm{sel}},
             \qquad
             B_{\mathrm{JIT}}=(1-r)(1-R_o)B_{\mathrm{sel}}=0.08B_{\mathrm{sel}}.
           \]
+          <div class="math-step">
+            <strong>Worked example: 100 entries in the final selected set</strong>
+            <div class="table-wrap">
+              <table class="math-table">
+                <thead><tr><th>State or event</th><th>Entries</th><th>Interpretation</th></tr></thead>
+                <tbody>
+                  <tr><td>Temporal-cache hit</td><td>60</td><td>Already resident; no host-to-device transfer</td></tr>
+                  <tr><td>True non-resident miss set</td><td>40</td><td>The entries that actually need materialization</td></tr>
+                  <tr><td>Correct early prefetch</td><td>32</td><td>80% recall over the 40 required misses</td></tr>
+                  <tr><td>False-positive prefetch</td><td>8</td><td>32 useful entries are 80% of 40 total prefetched entries</td></tr>
+                  <tr><td>Just-in-time fetch</td><td>8</td><td>The 20% of true misses not covered by the oracle</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p>The host transfers 40 entries speculatively plus 8 just in time: 48 entries in total. With perfect overlap, only the 8 just-in-time entries block the current token. Fetch-at-decode would transfer only the 40 true misses, but all 40 would be exposed on the critical path. Because the selected set itself is 1.5625% of context, the 48 transferred entry-equivalents are 0.75% of the full context.</p>
+          </div>
           <p>The total newly materialized traffic is 0.48× the selected set, versus 0.40× for fetch-at-decode with the same reuse. Prefetch is allowed to overlap the preceding token, but the selector and the 0.08× just-in-time miss set remain on the current token's critical path. The measured proxy provides about 22.0 GB/s to one GPU and 25.4 GB/s aggregate to both TP2 GPUs, so</p>
           \[
             t_{\mathrm{JIT,TP2}}\approx\max\!\left(
@@ -723,7 +746,7 @@
               </tbody>
             </table>
           </div>
-          <p class="math-note">A perfect authoritative oracle would use \(R_o=P_o=1\) and could make verification optional. This page is stricter: the 80/80 oracle is advisory, so landmark selection still executes to preserve accuracy.</p>
+          <p class="math-note">Provenance matters: the 60% central value is adapted from ShadowKV's reported roughly 60% chunk hit rate/temporal locality. The assumed oracle recall and oracle precision are both 80%; these are hypothetical values for this report's proposed token-ahead predictor, not measurements reported by ShadowKV or validated on these frontier models. A perfect authoritative oracle would use \(R_o=P_o=1\) and could make verification optional. This page instead keeps landmark selection on the critical path to verify the advisory oracle.</p>
 
           <h3>3. Memory and admission capacity</h3>
           <p>For admitted concurrency \(C\), the simplified per-node HBM and host-memory constraints are</p>
