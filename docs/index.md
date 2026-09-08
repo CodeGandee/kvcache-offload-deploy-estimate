@@ -18,6 +18,8 @@ The first published case covers:
 - Official compressed model weights, fused conversion, and BF16 compute.
 - BF16 or FP8 exact-KV storage.
 - ShadowKV-style 1.56% cache selection.
+- A common HBM-only OOM admission boundary for every case, with system-RAM capacity
+  unbounded and finite host-transfer bandwidth retained in latency.
 - An advisory token-ahead oracle with 80% recall/precision and a fetch-at-decode case,
   both with 60% temporal reuse.
 - A no-ShadowKV control that preserves native attention/cache compression, keeps all

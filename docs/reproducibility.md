@@ -59,7 +59,7 @@ central case deliberately omits `--trust-oracle`, so it still verifies the curre
 token with landmarks.
 
 `pixi run profiles` reads the official tracked model configs, executes the GenZ
-roofline sweep for 1–1,152 sequences, and writes deterministic
+roofline sweep for 1–4,096 sequences, and writes deterministic
 `per_sequence.csv` bundles under `data/profiles/llmservingsim/`. Each bundle contains
 both total-core rows and PP-stage rows. The report build
 regenerates those profiles automatically. The estimator then reads the profiles

@@ -118,7 +118,6 @@ class Scenario:
     model_key: str
     model: str
     context_tokens: int
-    max_users: int
     model_layers: int
     cache_layers: int
     cached_width: int
@@ -129,9 +128,8 @@ class Scenario:
     weight_per_gpu_gb: float
     mtp_draft_tokens: int = 0
 
-    @property
-    def load_users(self) -> tuple[int, int, int, int, int]:
-        return load_users_for_max(self.max_users)
+    def load_users(self, storage: StorageName) -> tuple[int, int, int, int, int]:
+        return load_users_for_max(shadowkv_max_users(self, storage=storage))
 
     def core_tpot_for_sequences(self, sequences: int, hardware: A800Host | None = None) -> float:
         """Return batch latency from the generated LLMServingSim profile."""
@@ -146,8 +144,8 @@ class Scenario:
         return analytical_decode_ms(self.model_key, sequences, roofline)
 
     def reference_tpot_for_users(self, users: int, hardware: A800Host | None = None) -> float:
-        if users < 1 or users > self.max_users:
-            raise ValueError("users must be between one and the admission ceiling")
+        if users < 1:
+            raise ValueError("users must be positive")
         return self.core_tpot_for_sequences(math.ceil(users / self.replicas), hardware)
 
     def core_stage_tpot_for_sequences(
@@ -164,20 +162,18 @@ class Scenario:
             return llmservingsim_decode_stage_ms(self.model_key, sequences)
         return analytical_decode_stage_ms(self.model_key, sequences, roofline)
 
-    @property
-    def ttft_seconds(self) -> tuple[float, float, float, float, float]:
+    def ttft_seconds(self, storage: StorageName) -> tuple[float, float, float, float, float]:
         single = analytical_prefill_seconds(self.model_key, self.context_tokens)
         return cast(
             tuple[float, float, float, float, float],
-            _burst_ttft(single, self.max_users, self.replicas)[0],
+            _burst_ttft(single, shadowkv_max_users(self, storage=storage), self.replicas)[0],
         )
 
-    @property
-    def last_ttft_seconds(self) -> tuple[float, float, float, float, float]:
+    def last_ttft_seconds(self, storage: StorageName) -> tuple[float, float, float, float, float]:
         single = analytical_prefill_seconds(self.model_key, self.context_tokens)
         return cast(
             tuple[float, float, float, float, float],
-            _burst_ttft(single, self.max_users, self.replicas)[1],
+            _burst_ttft(single, shadowkv_max_users(self, storage=storage), self.replicas)[1],
         )
 
 
@@ -473,6 +469,113 @@ def native_cache_gib_per_gpu(
     return per_gpu_values * stored_bytes_per_value(storage) / 2**30
 
 
+SHADOW_RANK = 160
+SHADOW_CHUNK_SIZE = 8
+SHADOW_LOCAL_CHUNKS = 4
+SHADOW_BUFFER_RESERVE = 128
+
+
+def _shadowed_layer_mask(scenario: Scenario) -> tuple[bool, ...]:
+    """Identify native layers replaced by the report's ShadowKV overlay."""
+
+    spec = MODEL_SPECS[scenario.model_key]
+    if spec.compress_ratios:
+        mask = tuple(ratio == 4 for ratio in spec.compress_ratios[: scenario.model_layers])
+    elif spec.layer_types:
+        mask = tuple(layer == "deepseek_sparse_attention" for layer in spec.layer_types)
+    else:
+        mask = (True,) * scenario.model_layers
+    if sum(mask) != scenario.cache_layers:
+        raise ValueError(f"ShadowKV layer mask mismatch for {scenario.id}")
+    return mask
+
+
+def _shadowkv_layer_value_counts(scenario: Scenario) -> tuple[float, float]:
+    """Return offloaded and full-resident HBM values for one overlaid layer.
+
+    The offloaded count follows the public ShadowKV tensor shapes: rank-160 U/SV,
+    chunk-8 landmarks, and a selected/outlier/local sparse buffer.  The frontier
+    adapter treats ``cached_width`` as its joint exact-cache path, so the sparse
+    buffer is counted once rather than inventing separate K/V widths for MLA.
+    Metadata and transient kernels are covered by the fixed runtime reserve.
+    """
+
+    context = scenario.context_tokens
+    width = scenario.cached_width
+    selected = selected_entries(context)
+    outlier_chunks = (selected // 1024) * 24
+    candidate_chunks = max(0, context // SHADOW_CHUNK_SIZE - SHADOW_LOCAL_CHUNKS)
+    landmark_entries = max(0, candidate_chunks - outlier_chunks)
+    sparse_entries = (
+        selected
+        + SHADOW_BUFFER_RESERVE
+        + (outlier_chunks + SHADOW_LOCAL_CHUNKS) * SHADOW_CHUNK_SIZE
+    )
+    low_rank = context * SHADOW_RANK + SHADOW_RANK * width
+    landmarks = landmark_entries * width
+    sparse_buffer = sparse_entries * width
+    offloaded = low_rank + landmarks + sparse_buffer
+    # Full-resident layers retain landmarks for the same sparse-selection path,
+    # but no longer require low-rank reconstruction or a duplicate exact buffer.
+    full_resident = context * width + landmarks
+    return float(offloaded), float(full_resident)
+
+
+def shadowkv_cache_gib_per_gpu(
+    scenario: Scenario,
+    *,
+    storage: StorageName,
+    users: int,
+    resident_layers: int = 0,
+) -> float:
+    """Maximum ShadowKV-related HBM allocation on one stage GPU.
+
+    Host-resident exact cache is intentionally excluded: the deployment case now
+    assumes unbounded system RAM.  Native layers outside the ShadowKV overlay remain
+    in HBM using their official compressed/recurrent-cache representation.
+    """
+
+    if users < 1:
+        raise ValueError("users must be positive")
+    if not 0 <= resident_layers <= scenario.cache_layers:
+        raise ValueError("resident layer count is outside the ShadowKV overlay")
+
+    spec = MODEL_SPECS[scenario.model_key]
+    mask = _shadowed_layer_mask(scenario)
+    native_layers = native_cache_layers(scenario)
+    model_stage_counts = stage_layer_counts(scenario.model_layers, scenario.pp_size)
+    shadow_counts: list[int] = []
+    unshadowed_values: list[float] = []
+    start = 0
+    for count in model_stage_counts:
+        stage_mask = mask[start : start + count]
+        stage_native = native_layers[start : start + count]
+        shadow_counts.append(sum(stage_mask))
+        unshadowed_values.append(
+            float(
+                sum(
+                    layer.main_entries * scenario.cached_width
+                    + layer.index_entries * spec.index_dim
+                    for layer, shadowed in zip(stage_native, stage_mask, strict=True)
+                    if not shadowed
+                )
+            )
+        )
+        start += count
+
+    resident_counts = _resident_counts_by_stage(shadow_counts, resident_layers)
+    offloaded_per_layer, resident_per_layer = _shadowkv_layer_value_counts(scenario)
+    stage_values = [
+        (shadowed - resident) * offloaded_per_layer + resident * resident_per_layer + native_values
+        for shadowed, resident, native_values in zip(
+            shadow_counts, resident_counts, unshadowed_values, strict=True
+        )
+    ]
+    local_users = math.ceil(users / scenario.replicas)
+    per_gpu_values = max(stage_values, default=0.0) * local_users / scenario.tp_size
+    return per_gpu_values * stored_bytes_per_value(storage) / 2**30
+
+
 def native_hbm_headroom_gib(
     scenario: Scenario,
     *,
@@ -485,6 +588,35 @@ def native_hbm_headroom_gib(
         raise ValueError("invalid HBM utilization or runtime reserve")
     weight_per_gpu_gib = scenario.weight_per_gpu_gb * 1e9 / 2**30
     return max(0.0, 80.0 * hbm_utilization - weight_per_gpu_gib - runtime_reserve_gib)
+
+
+def shadowkv_max_users(
+    scenario: Scenario,
+    *,
+    storage: StorageName,
+    resident_layers: int = 0,
+    hbm_utilization: float = 0.90,
+    runtime_reserve_gib: float = 6.0,
+) -> int:
+    """HBM-only ShadowKV admission ceiling with unbounded host-cache capacity."""
+
+    per_replica_user = shadowkv_cache_gib_per_gpu(
+        scenario,
+        storage=storage,
+        users=1,
+        resident_layers=resident_layers,
+    )
+    if per_replica_user <= 0.0:
+        raise ValueError("ShadowKV state must consume positive HBM")
+    per_replica = math.floor(
+        native_hbm_headroom_gib(
+            scenario,
+            hbm_utilization=hbm_utilization,
+            runtime_reserve_gib=runtime_reserve_gib,
+        )
+        / per_replica_user
+    )
+    return max(0, per_replica * scenario.replicas)
 
 
 def no_shadowkv_max_users(
@@ -638,9 +770,10 @@ def _estimate_once(
     mtp_accepted_tokens: int = 0,
     microbatch_override: int | None = None,
 ) -> tuple[float, tuple[TraceEvent, ...]]:
-    users = scenario.load_users[load_index] if users_override is None else users_override
-    if not 1 <= users <= scenario.max_users:
-        raise ValueError("users must be within the scenario admission ceiling")
+    maximum = shadowkv_max_users(scenario, storage=storage)
+    users = load_users_for_max(maximum)[load_index] if users_override is None else users_override
+    if not 1 <= users <= maximum:
+        raise ValueError("users must be within the ShadowKV HBM admission ceiling")
     if not 0 <= resident_layers <= scenario.cache_layers:
         raise ValueError("resident_layers must be within the cache-bearing layer count")
     if mtp_accepted_tokens < 0:
@@ -998,7 +1131,11 @@ def estimate_point(
             return central
         return values[min(len(values) - 1, round((len(values) - 1) * fraction))]
 
-    users = scenario.load_users[load_index] if users_override is None else users_override
+    users = (
+        load_users_for_max(shadowkv_max_users(scenario, storage=storage))[load_index]
+        if users_override is None
+        else users_override
+    )
     aggregate = 1000.0 * users / central
     selected_microbatch = _optimal_microbatch_size(
         scenario,
@@ -1241,7 +1378,7 @@ def estimate_residency_scan(
     headroom = 80.0 * hbm_utilization - weight_per_gpu_gib - runtime_reserve_gib
     points = []
     for requested, layers, exact in residency_scan(scenario.cache_layers):
-        resident_gib = resident_cache_gib_per_gpu(
+        resident_gib = shadowkv_cache_gib_per_gpu(
             scenario,
             storage=storage,
             users=users,
@@ -1286,18 +1423,17 @@ def _burst_ttft(
 
 
 SCENARIOS: tuple[Scenario, ...] = (
-    Scenario("kimi-72", "kimi", "Kimi Code 2.7", 73_728, 48, 61, 61, 576, 8, 2, 2, 1, 37.2, 0),
-    Scenario("kimi-128", "kimi", "Kimi Code 2.7", 131_072, 28, 61, 61, 576, 8, 2, 2, 1, 37.2, 0),
-    Scenario("kimi-256", "kimi", "Kimi Code 2.7", 262_144, 14, 61, 61, 576, 8, 2, 2, 1, 37.2, 0),
-    Scenario("glm-72", "glm", "GLM-5.3", 73_728, 48, 78, 78, 576, 8, 2, 2, 1, 47.225, 3),
-    Scenario("glm-128", "glm", "GLM-5.3", 131_072, 40, 78, 78, 576, 8, 2, 2, 1, 47.225, 3),
-    Scenario("glm-256", "glm", "GLM-5.3", 262_144, 30, 78, 78, 576, 8, 2, 2, 1, 47.225, 3),
+    Scenario("kimi-72", "kimi", "Kimi Code 2.7", 73_728, 61, 61, 576, 8, 2, 2, 1, 37.2, 0),
+    Scenario("kimi-128", "kimi", "Kimi Code 2.7", 131_072, 61, 61, 576, 8, 2, 2, 1, 37.2, 0),
+    Scenario("kimi-256", "kimi", "Kimi Code 2.7", 262_144, 61, 61, 576, 8, 2, 2, 1, 37.2, 0),
+    Scenario("glm-72", "glm", "GLM-5.3", 73_728, 78, 78, 576, 8, 2, 2, 1, 47.225, 3),
+    Scenario("glm-128", "glm", "GLM-5.3", 131_072, 78, 78, 576, 8, 2, 2, 1, 47.225, 3),
+    Scenario("glm-256", "glm", "GLM-5.3", 262_144, 78, 78, 576, 8, 2, 2, 1, 47.225, 3),
     Scenario(
         "glm-flash-72",
         "glm-flash",
         "GLM-5.3-Flash",
         73_728,
-        80,
         45,
         11,
         512,
@@ -1313,7 +1449,6 @@ SCENARIOS: tuple[Scenario, ...] = (
         "glm-flash",
         "GLM-5.3-Flash",
         131_072,
-        64,
         45,
         11,
         512,
@@ -1329,7 +1464,6 @@ SCENARIOS: tuple[Scenario, ...] = (
         "glm-flash",
         "GLM-5.3-Flash",
         262_144,
-        48,
         45,
         11,
         512,
@@ -1345,7 +1479,6 @@ SCENARIOS: tuple[Scenario, ...] = (
         "deepseek-flash",
         "DeepSeek V4 Flash",
         73_728,
-        80,
         43,
         21,
         512,
@@ -1361,7 +1494,6 @@ SCENARIOS: tuple[Scenario, ...] = (
         "deepseek-flash",
         "DeepSeek V4 Flash",
         131_072,
-        64,
         43,
         21,
         512,
@@ -1377,7 +1509,6 @@ SCENARIOS: tuple[Scenario, ...] = (
         "deepseek-flash",
         "DeepSeek V4 Flash",
         262_144,
-        48,
         43,
         21,
         512,
@@ -1405,19 +1536,31 @@ def build_report(
             "id": scenario.id,
             "model": scenario.model,
             "context_tokens": scenario.context_tokens,
-            "max_users": scenario.max_users,
-            "load_users": scenario.load_users,
             "stage_layer_counts": stage_layer_counts(scenario.cache_layers, scenario.pp_size),
-            "ttft_seconds": scenario.ttft_seconds,
-            "last_ttft_seconds": scenario.last_ttft_seconds,
-            "core_profile_ms": tuple(
-                scenario.reference_tpot_for_users(users) for users in scenario.load_users
-            ),
             "core_single_user_breakdown": decode_breakdown(scenario.model_key, 1),
             "results": {},
         }
         for storage in ("bf16", "fp8"):
             storage_results: dict[str, Any] = {}
+            shadow_max = shadowkv_max_users(scenario, storage=storage)
+            if shadow_max < 1:
+                raise RuntimeError(f"{scenario.id} cannot admit one ShadowKV request")
+            shadow_users = load_users_for_max(shadow_max)
+            single_prefill = analytical_prefill_seconds(scenario.model_key, scenario.context_tokens)
+            shadow_ttft, shadow_last = _burst_ttft(single_prefill, shadow_max, scenario.replicas)
+            storage_results["shadowkv-admission"] = {
+                "max_users": shadow_max,
+                "load_users": shadow_users,
+                "shadowkv_cache_gib_per_gpu_per_user": shadowkv_cache_gib_per_gpu(
+                    scenario, storage=storage, users=1
+                ),
+                "hbm_headroom_gib": native_hbm_headroom_gib(scenario),
+                "ttft_seconds": shadow_ttft,
+                "last_ttft_seconds": shadow_last,
+                "core_profile_ms": tuple(
+                    scenario.reference_tpot_for_users(users) for users in shadow_users
+                ),
+            }
             for policy in ("oracle-prefetch", "fetch-at-decode"):
                 points = [
                     estimate_point(
@@ -1458,7 +1601,7 @@ def build_report(
             cast(dict[str, Any], item["results"])[storage] = storage_results
         series.append(item)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "engine": {
             "name": "GenZ roofline → LLMServingSim profile tables → ShadowKV trace extension",
             "genz_commit": GENZ_COMMIT,
@@ -1471,11 +1614,17 @@ def build_report(
         },
         "shadowkv": {
             "selection_fraction": 1.0 / 64.0,
+            "rank": SHADOW_RANK,
+            "chunk_size": SHADOW_CHUNK_SIZE,
             "temporal_reuse": reuse,
             "oracle_recall": oracle.recall,
             "oracle_precision": oracle.precision,
             "oracle_lookahead_tokens": oracle.lookahead_tokens,
             "selection_verified_at_decode": oracle.verify_with_landmarks,
+            "admission": "HBM-only OOM boundary; system-RAM capacity is unbounded",
+            "tensor_parallel_cache_placement": "ideal sharding; all busiest-stage layers included",
+            "hbm_utilization": 0.90,
+            "runtime_reserve_gib_per_gpu": 6.0,
         },
         "sensitivity": {
             "samples": sensitivity_samples,
@@ -1519,23 +1668,27 @@ def build_interactive_dataset(*, sensitivity_samples: int = 256) -> dict[str, An
     residency_loads = (0, *range(10, 101, 10))
     series = []
     for scenario in SCENARIOS:
+        default_max = shadowkv_max_users(scenario, storage="bf16")
+        default_users = load_users_for_max(default_max)
         item: dict[str, Any] = {
             "id": scenario.id,
             "model": scenario.model,
             "context": scenario.context_tokens // 1024,
-            "max": scenario.max_users,
+            "max": default_max,
             "mtpDraft": scenario.mtp_draft_tokens,
-            "ttft": scenario.ttft_seconds,
-            "last": scenario.last_ttft_seconds,
-            "core": [
-                round(scenario.reference_tpot_for_users(users), 4) for users in scenario.load_users
-            ],
+            "ttft": scenario.ttft_seconds("bf16"),
+            "last": scenario.last_ttft_seconds("bf16"),
+            "core": [round(scenario.reference_tpot_for_users(users), 4) for users in default_users],
             "base": {},
             "mtp": {},
             "residency": {},
             "admission": {},
         }
         for storage in ("bf16", "fp8"):
+            shadow_max = shadowkv_max_users(scenario, storage=storage)
+            if shadow_max < 1:
+                raise RuntimeError(f"{scenario.id} cannot admit one ShadowKV request")
+            shadow_users = load_users_for_max(shadow_max)
             base_storage: dict[str, Any] = {}
             mtp_storage: dict[str, Any] = {}
             residency_storage: dict[str, Any] = {}
@@ -1571,11 +1724,7 @@ def build_interactive_dataset(*, sensitivity_samples: int = 256) -> dict[str, An
                     }
                 residency_curves = []
                 for load in residency_loads:
-                    users = (
-                        1
-                        if load == 0
-                        else max(1, math.floor(scenario.max_users * load / 100 + 0.5))
-                    )
+                    users = 1 if load == 0 else max(1, math.floor(shadow_max * load / 100 + 0.5))
                     points = estimate_residency_scan(
                         scenario,
                         users=users,
@@ -1632,8 +1781,19 @@ def build_interactive_dataset(*, sensitivity_samples: int = 256) -> dict[str, An
                     for accepted in (1, 2)
                 }
             single_prefill = analytical_prefill_seconds(scenario.model_key, scenario.context_tokens)
+            shadow_ttft, shadow_last = _burst_ttft(single_prefill, shadow_max, scenario.replicas)
             native_ttft, native_last = _burst_ttft(single_prefill, native_max, scenario.replicas)
             cast(dict[str, Any], item["admission"])[storage] = {
+                "shadowKV": {
+                    "max": shadow_max,
+                    "users": shadow_users,
+                    "ttft": shadow_ttft,
+                    "last": shadow_last,
+                    "cacheGiBPerGpuPerUser": round(
+                        shadowkv_cache_gib_per_gpu(scenario, storage=storage, users=1), 6
+                    ),
+                    "hbmHeadroomGiB": round(native_hbm_headroom_gib(scenario), 6),
+                },
                 "noShadow": {
                     "max": native_max,
                     "users": native_users,
@@ -1643,14 +1803,14 @@ def build_interactive_dataset(*, sensitivity_samples: int = 256) -> dict[str, An
                         native_cache_gib_per_gpu(scenario, storage=storage, users=1), 6
                     ),
                     "hbmHeadroomGiB": round(native_hbm_headroom_gib(scenario), 6),
-                }
+                },
             }
             cast(dict[str, Any], item["base"])[storage] = base_storage
             cast(dict[str, Any], item["mtp"])[storage] = mtp_storage
             cast(dict[str, Any], item["residency"])[storage] = residency_storage
         series.append(item)
     return {
-        "schemaVersion": 5,
+        "schemaVersion": 6,
         "loads": [0, 25, 50, 75, 100],
         "residencyLoads": list(residency_loads),
         "residencyRequested": list(range(0, 101, 10)),
@@ -1660,7 +1820,13 @@ def build_interactive_dataset(*, sensitivity_samples: int = 256) -> dict[str, An
             "mtpExtraCandidatesUseDecodeFetch": True,
             "hbmUtilization": 0.90,
             "runtimeReserveGiB": 6.0,
+            "systemRAMCapacity": "unbounded",
+            "tensorParallelCachePlacement": "ideal-sharded",
+            "tpReplicationSensitivity": "remove the 1/TP cache factor; Kimi-128 FP8 ShadowKV falls from 255 to 127 users",
             "residentLayersAreBalancedAcrossStages": True,
+            "shadowKVAdmissionIsMemoryOnly": True,
+            "shadowKVRank": SHADOW_RANK,
+            "shadowKVChunkSize": SHADOW_CHUNK_SIZE,
             "noShadowKVAdmissionIsMemoryOnly": True,
             "noShadowKVRejectsBeyondAdmission": True,
             "noShadowKVNativeIndexCacheIsSharedAcrossHeads": True,

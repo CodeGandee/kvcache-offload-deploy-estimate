@@ -17,8 +17,11 @@ from kvcache_offload_deploy_estimate.llmservingsim_shadowkv import (
     estimate_point,
     estimate_residency_scan,
     native_cache_gib_per_gpu,
+    native_hbm_headroom_gib,
     no_shadowkv_max_users,
     residency_scan,
+    shadowkv_cache_gib_per_gpu,
+    shadowkv_max_users,
     stage_layer_counts,
     stored_bytes_per_value,
 )
@@ -169,7 +172,7 @@ def test_full_residency_removes_host_payload_and_reduces_tpot() -> None:
     scenario = next(item for item in SCENARIOS if item.id == "glm-128")
     points = estimate_residency_scan(
         scenario,
-        users=scenario.max_users,
+        users=shadowkv_max_users(scenario, storage="fp8"),
         policy="fetch-at-decode",
         storage="fp8",
     )
@@ -252,9 +255,10 @@ def test_generated_moe_profile_grows_with_distinct_experts() -> None:
 
 def test_pp8_scheduler_uses_enough_groups_to_fill_pipeline() -> None:
     scenario = next(item for item in SCENARIOS if item.id == "glm-128")
+    maximum = shadowkv_max_users(scenario, storage="fp8")
     microbatch = _optimal_microbatch_size(
         scenario,
-        users=scenario.max_users,
+        users=maximum,
         policy="oracle-prefetch",
         storage="fp8",
         oracle=OraclePrefetch(),
@@ -262,7 +266,16 @@ def test_pp8_scheduler_uses_enough_groups_to_fill_pipeline() -> None:
         resident_layers=0,
         mtp_accepted_tokens=0,
     )
-    assert microbatch <= math.ceil(scenario.max_users / scenario.pp_size)
+    assert microbatch <= math.ceil(maximum / scenario.pp_size)
+
+
+def test_shadowkv_admission_is_an_hbm_limit_with_unbounded_host_ram() -> None:
+    scenario = next(item for item in SCENARIOS if item.id == "glm-256")
+    maximum = shadowkv_max_users(scenario, storage="bf16")
+    headroom = native_hbm_headroom_gib(scenario)
+    assert maximum > no_shadowkv_max_users(scenario, storage="bf16")
+    assert shadowkv_cache_gib_per_gpu(scenario, storage="bf16", users=maximum) <= headroom
+    assert shadowkv_cache_gib_per_gpu(scenario, storage="bf16", users=maximum + 1) > headroom
 
 
 def test_no_shadowkv_admission_is_a_full_native_cache_hbm_limit() -> None:

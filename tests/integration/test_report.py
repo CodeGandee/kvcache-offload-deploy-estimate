@@ -35,9 +35,14 @@ def test_report_includes_72k_mtp_and_whole_layer_residency() -> None:
     assert "Measured A100 hardware proxy" in report
     assert "25.4 GB/s aggregate" in report
     assert '"modelCoreFloorReplaced":true' in report
-    assert '"schemaVersion":5' in report
+    assert '"schemaVersion":6' in report
     assert '"microbatch":' in report
     assert '"noShadow":' in report
+    assert '"shadowKVAdmissionIsMemoryOnly":true' in report
+    assert '"systemRAMCapacity":"unbounded"' in report
+    assert '"tensorParallelCachePlacement":"ideal-sharded"' in report
+    assert "HBM OOM boundary" in report
+    assert "busiest PP8 stage contains eight" in report
 
 
 def test_all_static_and_dynamic_math_sections_are_rendered() -> None:

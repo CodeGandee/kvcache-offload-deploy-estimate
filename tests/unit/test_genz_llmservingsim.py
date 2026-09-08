@@ -52,4 +52,4 @@ def test_generated_bundle_uses_llmservingsim_per_sequence_schema() -> None:
     assert rows[0].keys() == {"layer", "sequences", "time_us"}
     assert rows[0]["layer"] == "model_core"
     assert rows[0]["sequences"] == "1"
-    assert rows[-1]["sequences"] == "1152"
+    assert rows[-1]["sequences"] == "4096"

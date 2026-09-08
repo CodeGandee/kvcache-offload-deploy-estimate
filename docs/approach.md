@@ -92,7 +92,7 @@ included. No cross-node expert parallelism is modeled.
 
 ## LLMServingSim bridge
 
-The GenZ sweep covers 1–1,152 simultaneous sequences and is written to:
+The GenZ sweep covers 1–4,096 simultaneous sequences and is written to:
 
 ```text
 data/profiles/llmservingsim/A100-SXM4-80GB/<model>/official-dequant-bf16/
@@ -179,6 +179,62 @@ t_{\mathrm{H2D,stage}}=\max\!\left(
 \right).
 \]
 
+## ShadowKV HBM admission
+
+Cases A and B use the same memory-only admission definition as the native-cache
+control. System-RAM capacity is unbounded: the exact offloaded cache can grow without
+causing admission failure. Host-DRAM and H2D bandwidth are still finite and remain in
+the TPOT model.
+
+The HBM footprint follows the public ShadowKV representation instead of equating the
+selected fraction with stored state. For context length \(N\), rank \(r_k=160\),
+chunk size \(c=8\), selected count \(S=\lceil N/64\rceil\), outlier chunks
+\(O=24\lfloor S/1024\rfloor\), cached width \(d_c\), landmark count \(n_L\), and
+sparse-buffer count \(n_B\):
+
+\[
+n_L=\max\!\left(0,\left\lfloor\frac{N}{c}\right\rfloor-4-O\right),
+\qquad
+n_B=S+128+c(O+4),
+\]
+
+\[
+V_{\mathrm{shadow,layer}}=Nr_k+r_kd_c+n_Ld_c+n_Bd_c.
+\]
+
+These terms represent the low-rank \(U\), low-rank \(SV\), chunk landmarks, and
+selected/outlier/local exact buffer. A fully resident overlaid layer uses
+\(Nd_c+n_Ld_c\). Native state outside the overlay remains in HBM in its official
+compressed or recurrent form.
+
+The number of layers is part of the per-GPU footprint. For stored bytes/value \(q\),
+TP degree \(G_s\), ShadowKV layers \(\mathcal L_{S,p}\), and native non-overlaid
+layers \(\mathcal L_{N,p}\) on PP stage \(p\):
+
+\[
+K_{\mathrm{GPU}}(q)=\frac{q}{G_s}\max_p\!\left[
+\sum_{\ell\in\mathcal L_{S,p}}V_{\mathrm{shadow},\ell}
++\sum_{\ell\in\mathcal L_{N,p}}V_{\mathrm{native},\ell}
+\right].
+\]
+
+The current figures assume ideal TP sharding. Replicated cache state replaces
+\(q/G_s\) with \(q\). For Kimi 128K FP8, the busiest PP8 stage has eight layers:
+native cache is 0.290 GiB/request/GPU when TP2-sharded and 0.580 GiB when replicated,
+so the respective native ceilings are 108 and 54. The modeled ShadowKV footprint is
+0.1228 GiB when sharded and 0.2456 GiB when replicated, giving 255 and 127 users.
+
+For the maximum-loaded stage GPU, the common planning OOM boundary is:
+
+\[
+H_{\mathrm{GPU}}=0.90(80\ \mathrm{GiB})-W_{\mathrm{GPU}}-6\ \mathrm{GiB},
+\qquad
+C_{\max}=R\left\lfloor\frac{H_{\mathrm{GPU}}}{K_{\mathrm{GPU}}}\right\rfloor.
+\]
+
+The next whole request is rejected. The 90% allocation fraction makes this a
+configured OOM boundary rather than a claim that every physical HBM byte is usable.
+
 ## No-ShadowKV native-cache control
 
 Case C removes landmarks, low-rank key reconstruction, sparse-selection overlays,
@@ -195,7 +251,7 @@ K_{\mathrm{GPU}}(N,q)=
 \max_p\frac{q}{G_s}\sum_{l\in p}[n_l(N)d_c+i_l(N)d_i].
 \]
 
-The no-offload admission ceiling is memory-only:
+The no-offload admission ceiling uses the same HBM-only rule:
 
 \[
 H_{\mathrm{GPU}}=0.90(80\ \mathrm{GiB})-W_{\mathrm{GPU}}-6\ \mathrm{GiB},
@@ -204,7 +260,8 @@ C_{\max}=R\left\lfloor\frac{H_{\mathrm{GPU}}}{K_{\mathrm{GPU}}}\right\rfloor.
 \]
 
 The first request above \(C_{\max}\) is rejected; no host spill or hidden wait queue is
-modeled. The index allocation uses one 128-value key per indexed position shared
+modeled. System-RAM capacity is likewise irrelevant to this case. The index allocation
+uses one 128-value key per indexed position shared
 across heads, matching the V4 Flash reference tensor. GLM uses the positions marked
 `full` in its official `indexer_types`; GLM Flash pools index positions by four.
 
